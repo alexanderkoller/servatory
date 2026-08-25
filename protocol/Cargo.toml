@@ -1,0 +1,13 @@
+[package]
+name = "s3-display-protocol"
+description = "Allocation-free wire protocol for the M5Stick S3 server display"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+postcard = { version = "1.1.3", default-features = false }
+serde = { version = "1.0.228", default-features = false, features = ["derive"] }
+
+[lints]
+workspace = true

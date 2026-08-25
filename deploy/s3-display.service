@@ -1,0 +1,18 @@
+[Unit]
+Description=M5Stick S3 Proxmox health display
+After=dev-m5stick\x2ds3.device
+BindsTo=dev-m5stick\x2ds3.device
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/s3-display-host --device /dev/m5stick-s3 --allow-shutdown
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+
