@@ -8,7 +8,7 @@ use embedded_graphics::{
     mono_font::{MonoTextStyle, ascii::FONT_6X10, ascii::FONT_10X20},
     pixelcolor::Rgb565,
     prelude::*,
-    primitives::{PrimitiveStyleBuilder, Rectangle},
+    primitives::{Arc, Line, PrimitiveStyleBuilder, Rectangle},
     text::Text,
 };
 use embedded_hal_bus::spi::ExclusiveDevice;
@@ -38,7 +38,8 @@ const DISPLAY_HEIGHT: u16 = 240;
 const DISPLAY_OFFSET_X: u16 = 52;
 const DISPLAY_OFFSET_Y: u16 = 40;
 const DEBOUNCE: Duration = Duration::from_millis(30);
-const LONG_PRESS: Duration = Duration::from_millis(2_000);
+const SHUTDOWN_ANIMATION_DELAY: Duration = Duration::from_millis(200);
+const LONG_PRESS: Duration = Duration::from_millis(3_000);
 const LINK_TIMEOUT: Duration = Duration::from_secs(15);
 const USB_ACTIVITY_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_DEVICE_FRAME_LEN: usize = 64;
@@ -160,6 +161,12 @@ impl Button {
         }
         None
     }
+
+    fn held_for(&self, now: Instant) -> Option<Duration> {
+        (self.stable_pressed && !self.long_press_sent)
+            .then(|| self.pressed_at.map(|started| now - started))
+            .flatten()
+    }
 }
 
 #[main]
@@ -218,6 +225,8 @@ fn main() -> ! {
     let mut last_sequence = None;
     let mut guest_snapshot = None;
     let mut page = 0_u8;
+    let mut shutdown_animation_active = false;
+    let mut shutdown_animation_height = 0_u16;
 
     // Render before attempting any USB traffic so offline operation always works.
     render(
@@ -237,7 +246,7 @@ fn main() -> ! {
         if !usb_connected && daemon == DaemonState::Connected {
             daemon = DaemonState::Stale;
         }
-        if usb_connected != was_usb_connected {
+        if usb_connected != was_usb_connected && !shutdown_animation_active {
             render(
                 &mut display,
                 usb_connected,
@@ -260,14 +269,16 @@ fn main() -> ! {
                         daemon = DaemonState::Connected;
                     }
                     usb_tx.enqueue(DeviceMessage::Ack { sequence });
-                    render(
-                        &mut display,
-                        usb_connected,
-                        daemon,
-                        page,
-                        last_sequence,
-                        guest_snapshot,
-                    );
+                    if !shutdown_animation_active {
+                        render(
+                            &mut display,
+                            usb_connected,
+                            daemon,
+                            page,
+                            last_sequence,
+                            guest_snapshot,
+                        );
+                    }
                 }
                 Ok(HostMessage::GuestSnapshot {
                     sequence, snapshot, ..
@@ -279,14 +290,16 @@ fn main() -> ! {
                         daemon = DaemonState::Connected;
                     }
                     usb_tx.enqueue(DeviceMessage::Ack { sequence });
-                    render(
-                        &mut display,
-                        usb_connected,
-                        daemon,
-                        page,
-                        last_sequence,
-                        guest_snapshot,
-                    );
+                    if !shutdown_animation_active {
+                        render(
+                            &mut display,
+                            usb_connected,
+                            daemon,
+                            page,
+                            last_sequence,
+                            guest_snapshot,
+                        );
+                    }
                 }
                 Ok(HostMessage::ShutdownAccepted) => {
                     daemon = DaemonState::PoweringOff;
@@ -307,19 +320,26 @@ fn main() -> ! {
             && last_update.is_some_and(|updated| now - updated >= LINK_TIMEOUT)
         {
             daemon = DaemonState::Stale;
-            render(
-                &mut display,
-                usb_connected,
-                daemon,
-                page,
-                last_sequence,
-                guest_snapshot,
-            );
+            if !shutdown_animation_active {
+                render(
+                    &mut display,
+                    usb_connected,
+                    daemon,
+                    page,
+                    last_sequence,
+                    guest_snapshot,
+                );
+            }
         }
 
         if let Some(action) = button.update(button_pin.is_low(), now) {
+            let canceled_shutdown = action == ButtonAction::NextScreen && shutdown_animation_active;
             if action == ButtonAction::NextScreen {
-                page = (page + 1) % 2;
+                if !canceled_shutdown {
+                    page = (page + 1) % 2;
+                }
+                shutdown_animation_active = false;
+                shutdown_animation_height = 0;
                 render(
                     &mut display,
                     usb_connected,
@@ -332,14 +352,109 @@ fn main() -> ! {
             // A recent decoded host update is the reliable session signal. The
             // USB SOF indicator is only advisory and may briefly read false even
             // while the serial connection is actively exchanging messages.
-            if daemon == DaemonState::Connected {
+            if action == ButtonAction::ShutdownRequested {
+                if daemon == DaemonState::Connected {
+                    draw_shutdown_progress(
+                        &mut display,
+                        shutdown_animation_height,
+                        DISPLAY_HEIGHT,
+                        !shutdown_animation_active,
+                    );
+                } else if shutdown_animation_active {
+                    render(
+                        &mut display,
+                        usb_connected,
+                        daemon,
+                        page,
+                        last_sequence,
+                        guest_snapshot,
+                    );
+                }
+                shutdown_animation_active = false;
+                shutdown_animation_height = 0;
+            }
+            if daemon == DaemonState::Connected && !canceled_shutdown {
                 usb_tx.enqueue(DeviceMessage::Button(action));
             }
+        } else if daemon == DaemonState::Connected
+            && let Some(held) = button.held_for(now)
+            && held >= SHUTDOWN_ANIMATION_DELAY
+        {
+            let height = shutdown_progress_height(held);
+            draw_shutdown_progress(
+                &mut display,
+                shutdown_animation_height,
+                height,
+                !shutdown_animation_active,
+            );
+            shutdown_animation_active = true;
+            shutdown_animation_height = height;
+        } else if shutdown_animation_active {
+            shutdown_animation_active = false;
+            shutdown_animation_height = 0;
+            render(
+                &mut display,
+                usb_connected,
+                daemon,
+                page,
+                last_sequence,
+                guest_snapshot,
+            );
         }
 
         usb_tx.poll(&mut usb);
         delay.delay_millis(10);
     }
+}
+
+fn shutdown_progress_height(held: Duration) -> u16 {
+    let elapsed = held
+        .as_millis()
+        .saturating_sub(SHUTDOWN_ANIMATION_DELAY.as_millis());
+    let animation_duration = LONG_PRESS.as_millis() - SHUTDOWN_ANIMATION_DELAY.as_millis();
+    let height = elapsed.saturating_mul(u64::from(DISPLAY_HEIGHT)) / animation_duration;
+    u16::try_from(height.min(u64::from(DISPLAY_HEIGHT))).unwrap_or(DISPLAY_HEIGHT)
+}
+
+fn draw_shutdown_progress<D>(display: &mut D, previous_height: u16, height: u16, clear: bool)
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    if clear {
+        display.clear(Rgb565::BLACK).ok();
+    }
+    if height > previous_height {
+        Rectangle::new(
+            Point::new(0, i32::from(DISPLAY_HEIGHT - height)),
+            Size::new(
+                u32::from(DISPLAY_WIDTH),
+                u32::from(height - previous_height),
+            ),
+        )
+        .into_styled(PrimitiveStyleBuilder::new().fill_color(Rgb565::RED).build())
+        .draw(display)
+        .ok();
+    }
+
+    draw_shutdown_symbol(display);
+}
+
+fn draw_shutdown_symbol<D>(display: &mut D)
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let style = PrimitiveStyleBuilder::new()
+        .stroke_color(Rgb565::WHITE)
+        .stroke_width(4)
+        .build();
+    Arc::new(Point::new(47, 100), 41, -45.0.deg(), 270.0.deg())
+        .into_styled(style)
+        .draw(display)
+        .ok();
+    Line::new(Point::new(67, 94), Point::new(67, 120))
+        .into_styled(style)
+        .draw(display)
+        .ok();
 }
 
 fn enable_lcd_power(i2c: &mut I2c<'_, esp_hal::Blocking>) -> Result<(), I2cError> {
