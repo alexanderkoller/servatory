@@ -9,6 +9,7 @@ pub const PROTOCOL_VERSION: u8 = 1;
 pub const MAX_FRAME_LEN: usize = 512;
 pub const MAX_GUESTS: usize = 8;
 pub const MAX_GUEST_NAME_LEN: usize = 20;
+pub const MAX_HOST_NAME_LEN: usize = 20;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[repr(transparent)]
@@ -168,6 +169,87 @@ impl GuestSnapshot {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HealthSnapshot {
+    pub uptime_seconds: u64,
+    pub cpu_percent: u8,
+    pub memory_used_mib: u32,
+    pub memory_total_mib: u32,
+    pub io_pressure_percent: u8,
+    pub load_average_x100: u16,
+    pub root_used_percent: u8,
+    pub backup_connected: bool,
+    pub network_up: bool,
+    pub network_mbps: u16,
+    pub ipv4: [u8; 4],
+    pub guests: GuestSnapshot,
+    host_name_len: u8,
+    host_name: [u8; MAX_HOST_NAME_LEN],
+}
+
+impl HealthSnapshot {
+    /// Creates a bounded, allocation-free host-health snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostNameError::TooLong`] when the UTF-8 name exceeds the wire limit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        host_name: &str,
+        uptime_seconds: u64,
+        cpu_percent: u8,
+        memory_used_mib: u32,
+        memory_total_mib: u32,
+        io_pressure_percent: u8,
+        load_average_x100: u16,
+        root_used_percent: u8,
+        backup_connected: bool,
+        network_up: bool,
+        network_mbps: u16,
+        ipv4: [u8; 4],
+        guests: GuestSnapshot,
+    ) -> Result<Self, HostNameError> {
+        if host_name.len() > MAX_HOST_NAME_LEN {
+            return Err(HostNameError::TooLong);
+        }
+        let mut bytes = [0; MAX_HOST_NAME_LEN];
+        bytes[..host_name.len()].copy_from_slice(host_name.as_bytes());
+        Ok(Self {
+            uptime_seconds,
+            cpu_percent: cpu_percent.min(100),
+            memory_used_mib,
+            memory_total_mib,
+            io_pressure_percent: io_pressure_percent.min(100),
+            load_average_x100,
+            root_used_percent: root_used_percent.min(100),
+            backup_connected,
+            network_up,
+            network_mbps,
+            ipv4,
+            guests,
+            host_name_len: u8::try_from(host_name.len()).unwrap_or(0),
+            host_name: bytes,
+        })
+    }
+
+    #[must_use]
+    pub fn host_name(&self) -> &str {
+        let len = usize::from(self.host_name_len).min(MAX_HOST_NAME_LEN);
+        core::str::from_utf8(&self.host_name[..len]).unwrap_or("?")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostNameError {
+    TooLong,
+}
+
+impl fmt::Display for HostNameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "host name exceeds {MAX_HOST_NAME_LEN} bytes")
+    }
+}
+
 /// Host-to-device messages. Variants may only be appended within a protocol version.
 // The no_std firmware deliberately uses a fixed-size inline snapshot instead of allocation.
 #[allow(clippy::large_enum_variant)]
@@ -183,6 +265,11 @@ pub enum HostMessage {
         sequence: Sequence,
         unix_seconds: UnixSeconds,
         snapshot: GuestSnapshot,
+    },
+    HealthSnapshot {
+        sequence: Sequence,
+        unix_seconds: UnixSeconds,
+        snapshot: HealthSnapshot,
     },
 }
 
@@ -369,6 +456,26 @@ mod tests {
                 unix_seconds: UnixSeconds::new(1_700_000_005),
                 snapshot: GuestSnapshot::from_slice(&[guest]),
             },
+            HostMessage::HealthSnapshot {
+                sequence: Sequence::new(44),
+                unix_seconds: UnixSeconds::new(1_700_000_010),
+                snapshot: HealthSnapshot::new(
+                    "pve-01",
+                    86_400,
+                    23,
+                    18_688,
+                    32_768,
+                    4,
+                    82,
+                    72,
+                    true,
+                    true,
+                    1_000,
+                    [10, 0, 0, 12],
+                    GuestSnapshot::from_slice(&[guest]),
+                )
+                .unwrap(),
+            },
         ];
         for expected in host_messages {
             let mut storage = [0; MAX_FRAME_LEN];
@@ -494,6 +601,47 @@ mod tests {
                 sequence: Sequence::new(u32::MAX),
                 unix_seconds: UnixSeconds::new(u64::MAX),
                 snapshot: GuestSnapshot::from_slice(&[guest; MAX_GUESTS]),
+            },
+            &mut storage,
+        )
+        .unwrap();
+        assert!(frame.len() <= MAX_FRAME_LEN);
+    }
+
+    #[test]
+    fn largest_health_snapshot_fits_the_frame_buffer() {
+        let guest = GuestSummary::new(
+            u32::MAX,
+            "12345678901234567890",
+            GuestKind::VirtualMachine,
+            GuestStatus::Running,
+            100,
+            u32::MAX,
+            u32::MAX,
+        )
+        .unwrap();
+        let snapshot = HealthSnapshot::new(
+            "12345678901234567890",
+            u64::MAX,
+            100,
+            u32::MAX,
+            u32::MAX,
+            100,
+            u16::MAX,
+            100,
+            true,
+            true,
+            u16::MAX,
+            [255; 4],
+            GuestSnapshot::from_slice(&[guest; MAX_GUESTS]),
+        )
+        .unwrap();
+        let mut storage = [0; MAX_FRAME_LEN];
+        let frame = encode_host(
+            HostMessage::HealthSnapshot {
+                sequence: Sequence::new(u32::MAX),
+                unix_seconds: UnixSeconds::new(u64::MAX),
+                snapshot,
             },
             &mut storage,
         )

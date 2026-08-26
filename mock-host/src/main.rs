@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use s3_display_host::{EventHandler, write_host_message};
-use s3_display_mock_host::{ConsoleShutdown, made_up_guests};
+use s3_display_mock_host::{ConsoleShutdown, made_up_health};
 use s3_display_protocol::{
     FrameDecoder, HostMessage, MAX_FRAME_LEN, Sequence, UnixSeconds, decode_device,
 };
@@ -23,7 +23,7 @@ struct Args {
     #[arg(long)]
     device: Option<PathBuf>,
 
-    /// Interval between mock guest snapshots.
+    /// Interval between mock health snapshots.
     #[arg(long, default_value_t = 5)]
     interval_seconds: u64,
 }
@@ -51,14 +51,14 @@ fn main() -> Result<()> {
                 .context("system clock is before the Unix epoch")?
                 .as_secs();
             write_host_message(
-                HostMessage::GuestSnapshot {
+                HostMessage::HealthSnapshot {
                     sequence,
                     unix_seconds: UnixSeconds::new(unix_seconds),
-                    snapshot: made_up_guests(),
+                    snapshot: made_up_health(),
                 },
                 &mut port,
             )?;
-            eprintln!("sent mock guest snapshot #{sequence}");
+            eprintln!("sent mock health snapshot #{sequence}");
             sequence = sequence.wrapping_next();
             next_update = Instant::now() + interval;
         }

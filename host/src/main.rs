@@ -11,6 +11,10 @@ use s3_display_protocol::{
     FrameDecoder, HostMessage, MAX_FRAME_LEN, Sequence, UnixSeconds, decode_device,
 };
 
+mod health;
+
+use health::HealthCollector;
+
 #[derive(Debug, Parser)]
 #[command(about = "Update an M5Stick S3 display over USB")]
 struct Args {
@@ -40,6 +44,7 @@ fn main() -> Result<()> {
     let mut decoder = FrameDecoder::<MAX_FRAME_LEN>::new();
     let mut handler = EventHandler::new(SystemdShutdown, args.allow_shutdown);
     let mut input = [0_u8; 64];
+    let mut health = HealthCollector::default();
 
     loop {
         if Instant::now() >= next_update {
@@ -48,9 +53,10 @@ fn main() -> Result<()> {
                 .context("system clock is before the Unix epoch")?
                 .as_secs();
             write_host_message(
-                HostMessage::Update {
+                HostMessage::HealthSnapshot {
                     sequence,
                     unix_seconds: UnixSeconds::new(unix_seconds),
+                    snapshot: health.collect(),
                 },
                 &mut port,
             )?;

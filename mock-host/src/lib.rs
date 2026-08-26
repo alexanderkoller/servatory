@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 
 use s3_display_host::Shutdown;
-use s3_display_protocol::{GuestKind, GuestSnapshot, GuestStatus, GuestSummary};
+use s3_display_protocol::{GuestKind, GuestSnapshot, GuestStatus, GuestSummary, HealthSnapshot};
 
 pub struct ConsoleShutdown<W> {
     output: W,
@@ -79,6 +79,31 @@ pub fn made_up_guests() -> GuestSnapshot {
     GuestSnapshot::from_slice(&guests)
 }
 
+/// Returns deterministic host data matching the landscape Split View mockup.
+///
+/// # Panics
+///
+/// Panics only if the built-in host name exceeds the protocol's fixed limit.
+#[must_use]
+pub fn made_up_health() -> HealthSnapshot {
+    HealthSnapshot::new(
+        "pve-01",
+        18 * 24 * 60 * 60 + 4 * 60 * 60,
+        23,
+        18_688,
+        32_768,
+        4,
+        82,
+        72,
+        true,
+        true,
+        1_000,
+        [10, 0, 0, 12],
+        made_up_guests(),
+    )
+    .expect("built-in mock host name fits the protocol")
+}
+
 fn guest(
     vmid: u32,
     name: &str,
@@ -120,6 +145,16 @@ mod tests {
                 .iter()
                 .any(|guest| guest.status == GuestStatus::Stopped)
         );
+    }
+
+    #[test]
+    fn mock_health_matches_the_ui_draft() {
+        let health = made_up_health();
+        assert_eq!(health.host_name(), "pve-01");
+        assert_eq!(health.cpu_percent, 23);
+        assert!(health.network_up);
+        assert!(health.backup_connected);
+        assert_eq!(health.guests.guests().len(), 5);
     }
 
     #[test]

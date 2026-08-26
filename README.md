@@ -1,7 +1,8 @@
 # M5Stick S3 Proxmox display
 
-This repository contains the basic plumbing for a tiny USB-connected Proxmox
-display. It deliberately does not define the final health screens yet.
+This repository contains a tiny USB-connected Proxmox health display. Its
+240x135 landscape Split View shows an overview followed by resources,
+storage/network, and guest screens.
 
 - `firmware/`: allocation-free Rust firmware for the M5Stick S3 (ESP32-S3).
 - `host/`: Linux daemon that sends regular updates and handles button events.
@@ -20,8 +21,8 @@ offline view distinguishes physical USB activity from a validated daemon
 session. All USB transmission is non-blocking, and shutdown requests are never
 queued across disconnected sessions.
 
-The front button changes between placeholder screens on a short press. Holding it
-for two seconds during a live daemon session sends a shutdown request. The host
+The front button changes between four health screens on a short press. Holding it
+for three seconds during a live daemon session sends a shutdown request. The host
 acknowledges that request on the display before invoking
 `/usr/bin/systemctl poweroff`. Shutdown handling is disabled unless the daemon is
 started with `--allow-shutdown`.
@@ -90,9 +91,10 @@ If auto-detection is ambiguous, select the serial device explicitly (for example
 cargo run -p s3-display-mock-host -- --device /dev/cu.usbmodem1101
 ```
 
-It repeatedly sends a deterministic set of fake VMs and containers. A two-second
-button hold is acknowledged like the production daemon, but only prints a message
-and exits; it never invokes an operating-system shutdown command.
+It repeatedly sends a deterministic health snapshot with fake host metrics, VMs,
+and containers. A three-second button hold is acknowledged like the production
+daemon, but only prints a message and exits; it never invokes an operating-system
+shutdown command.
 
 ## Install on Proxmox
 
@@ -138,6 +140,18 @@ sudo systemctl enable --now s3-display.service
 The udev rule matches Espressif's standard USB Serial/JTAG VID/PID. If the server
 has multiple matching boards, extend the rule with the StickS3's serial number.
 
+## Health data
+
+Every update contains a fixed-size health snapshot. The production daemon reads
+CPU, memory, load, uptime, and I/O pressure from `/proc`; root usage from `df`;
+link state and speed from `/sys/class/net`; and the first IPv4 address reported by
+`hostname -I`. A mounted Proxmox storage path below `/mnt/pve/` is shown as the
+backup connection. Guest state comes from `pvesh get /cluster/resources --type
+vm` and is bounded to eight entries on the display.
+
+The mock host sends deterministic values matching the Split View design, so all
+four pages can be exercised away from a Proxmox installation.
+
 ## Wire protocol
 
 Both sides import the same Rust `HostMessage` and `DeviceMessage` enums from the
@@ -146,6 +160,5 @@ COBS using a zero-byte delimiter. Receive buffers are statically bounded, and a
 versioned envelope rejects incompatible schemas. Within one protocol version,
 enum variants are append-only and must not be reordered.
 
-The current typed `Update` variant is intentionally a content-neutral heartbeat.
-We can extend the shared schema with a snapshot payload after deciding what each
-screen should show.
+The current health snapshot is allocation-free on the device and remains within
+the protocol's fixed 512-byte frame buffer, including the maximum guest list.

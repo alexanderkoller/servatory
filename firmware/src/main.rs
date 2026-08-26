@@ -5,8 +5,10 @@
 use core::fmt::Write as _;
 
 use embedded_graphics::{
+    framebuffer::{Framebuffer, buffer_size},
+    image::Image,
     mono_font::{MonoTextStyle, ascii::FONT_6X10, ascii::FONT_10X20},
-    pixelcolor::Rgb565,
+    pixelcolor::{Rgb565, raw::BigEndian},
     prelude::*,
     primitives::{Arc, Line, PrimitiveStyleBuilder, Rectangle},
     text::Text,
@@ -24,16 +26,33 @@ use esp_hal::{
     usb_serial_jtag::UsbSerialJtag,
 };
 use heapless::{Deque, String};
-use mipidsi::{Builder, interface::SpiInterface, models::ST7789, options::ColorInversion};
+use mipidsi::{
+    Builder,
+    interface::SpiInterface,
+    models::ST7789,
+    options::{ColorInversion, Orientation, Rotation},
+};
 use s3_display_protocol::{
-    ButtonAction, DeviceMessage, FrameDecoder, GuestKind, GuestSnapshot, GuestStatus, HostMessage,
+    ButtonAction, DeviceMessage, FrameDecoder, GuestKind, GuestStatus, HealthSnapshot, HostMessage,
     MAX_FRAME_LEN, Sequence, decode_host, encode_device,
 };
+use static_cell::StaticCell;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-const DISPLAY_WIDTH: u16 = 135;
-const DISPLAY_HEIGHT: u16 = 240;
+const PANEL_WIDTH: u16 = 135;
+const PANEL_HEIGHT: u16 = 240;
+const DISPLAY_WIDTH: u16 = 240;
+const DISPLAY_HEIGHT: u16 = 135;
+type ScreenBuffer = Framebuffer<
+    Rgb565,
+    <Rgb565 as PixelColor>::Raw,
+    BigEndian,
+    240,
+    135,
+    { buffer_size::<Rgb565>(240, 135) },
+>;
+static SCREEN_BUFFER: StaticCell<ScreenBuffer> = StaticCell::new();
 // M5Stack does not publish controller RAM offsets; these match this 135x240 panel family.
 const DISPLAY_OFFSET_X: u16 = 52;
 const DISPLAY_OFFSET_Y: u16 = 40;
@@ -52,6 +71,19 @@ enum DaemonState {
     Connected,
     Stale,
     PoweringOff,
+}
+
+#[derive(Clone, Copy)]
+enum UiIcon {
+    Cpu,
+    Memory,
+    Disk,
+    Network,
+    Guests,
+    Qemu,
+    Container,
+    Io,
+    Load,
 }
 
 struct UsbTx {
@@ -201,12 +233,14 @@ fn main() -> ! {
     let mut display_buffer = [0_u8; 512];
     let interface = SpiInterface::new(spi_device, dc, &mut display_buffer);
     let mut display = Builder::new(ST7789, interface)
-        .display_size(DISPLAY_WIDTH, DISPLAY_HEIGHT)
+        .display_size(PANEL_WIDTH, PANEL_HEIGHT)
         .display_offset(DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y)
+        .orientation(Orientation::new().rotate(Rotation::Deg90))
         .invert_colors(ColorInversion::Inverted)
         .reset_pin(reset)
         .init(&mut delay)
         .expect("display initialization");
+    let framebuffer = SCREEN_BUFFER.init(ScreenBuffer::new());
     backlight.set_high();
 
     // KEY1 is the front button used for navigation and shutdown.
@@ -223,7 +257,7 @@ fn main() -> ! {
     let mut last_usb_activity = None;
     let mut last_update = None;
     let mut last_sequence = None;
-    let mut guest_snapshot = None;
+    let mut health_snapshot = None;
     let mut page = 0_u8;
     let mut shutdown_animation_active = false;
     let mut shutdown_animation_height = 0_u16;
@@ -231,11 +265,12 @@ fn main() -> ! {
     // Render before attempting any USB traffic so offline operation always works.
     render(
         &mut display,
+        framebuffer,
         usb_connected,
         daemon,
         page,
         last_sequence,
-        guest_snapshot,
+        health_snapshot,
     );
     usb_tx.enqueue(DeviceMessage::Ready);
 
@@ -243,17 +278,22 @@ fn main() -> ! {
         let now = Instant::now();
         let was_usb_connected = usb_connected;
         usb_connected = poll_usb_connection(now, &mut last_usb_activity);
-        if !usb_connected && daemon == DaemonState::Connected {
-            daemon = DaemonState::Stale;
-        }
-        if usb_connected != was_usb_connected && !shutdown_animation_active {
+        // USB SOF activity is advisory and can momentarily disappear while a
+        // valid serial session is alive. Only decoded-update timeout changes an
+        // established session to stale; physical activity redraws the waiting
+        // screen only before a session has been established.
+        if usb_connected != was_usb_connected
+            && daemon == DaemonState::Waiting
+            && !shutdown_animation_active
+        {
             render(
                 &mut display,
+                framebuffer,
                 usb_connected,
                 daemon,
                 page,
                 last_sequence,
-                guest_snapshot,
+                health_snapshot,
             );
         }
 
@@ -272,20 +312,18 @@ fn main() -> ! {
                     if !shutdown_animation_active {
                         render(
                             &mut display,
+                            framebuffer,
                             usb_connected,
                             daemon,
                             page,
                             last_sequence,
-                            guest_snapshot,
+                            health_snapshot,
                         );
                     }
                 }
-                Ok(HostMessage::GuestSnapshot {
-                    sequence, snapshot, ..
-                }) => {
+                Ok(HostMessage::GuestSnapshot { sequence, .. }) => {
                     last_update = Some(now);
                     last_sequence = Some(sequence);
-                    guest_snapshot = Some(snapshot);
                     if daemon != DaemonState::PoweringOff {
                         daemon = DaemonState::Connected;
                     }
@@ -293,11 +331,34 @@ fn main() -> ! {
                     if !shutdown_animation_active {
                         render(
                             &mut display,
+                            framebuffer,
                             usb_connected,
                             daemon,
                             page,
                             last_sequence,
-                            guest_snapshot,
+                            health_snapshot,
+                        );
+                    }
+                }
+                Ok(HostMessage::HealthSnapshot {
+                    sequence, snapshot, ..
+                }) => {
+                    last_update = Some(now);
+                    last_sequence = Some(sequence);
+                    health_snapshot = Some(snapshot);
+                    if daemon != DaemonState::PoweringOff {
+                        daemon = DaemonState::Connected;
+                    }
+                    usb_tx.enqueue(DeviceMessage::Ack { sequence });
+                    if !shutdown_animation_active {
+                        render(
+                            &mut display,
+                            framebuffer,
+                            usb_connected,
+                            daemon,
+                            page,
+                            last_sequence,
+                            health_snapshot,
                         );
                     }
                 }
@@ -305,11 +366,12 @@ fn main() -> ! {
                     daemon = DaemonState::PoweringOff;
                     render(
                         &mut display,
+                        framebuffer,
                         usb_connected,
                         daemon,
                         page,
                         last_sequence,
-                        guest_snapshot,
+                        health_snapshot,
                     );
                 }
                 Err(_) => {}
@@ -323,11 +385,12 @@ fn main() -> ! {
             if !shutdown_animation_active {
                 render(
                     &mut display,
+                    framebuffer,
                     usb_connected,
                     daemon,
                     page,
                     last_sequence,
-                    guest_snapshot,
+                    health_snapshot,
                 );
             }
         }
@@ -336,17 +399,18 @@ fn main() -> ! {
             let canceled_shutdown = action == ButtonAction::NextScreen && shutdown_animation_active;
             if action == ButtonAction::NextScreen {
                 if !canceled_shutdown {
-                    page = (page + 1) % 2;
+                    page = (page + 1) % 4;
                 }
                 shutdown_animation_active = false;
                 shutdown_animation_height = 0;
                 render(
                     &mut display,
+                    framebuffer,
                     usb_connected,
                     daemon,
                     page,
                     last_sequence,
-                    guest_snapshot,
+                    health_snapshot,
                 );
             }
             // A recent decoded host update is the reliable session signal. The
@@ -363,11 +427,12 @@ fn main() -> ! {
                 } else if shutdown_animation_active {
                     render(
                         &mut display,
+                        framebuffer,
                         usb_connected,
                         daemon,
                         page,
                         last_sequence,
-                        guest_snapshot,
+                        health_snapshot,
                     );
                 }
                 shutdown_animation_active = false;
@@ -394,11 +459,12 @@ fn main() -> ! {
             shutdown_animation_height = 0;
             render(
                 &mut display,
+                framebuffer,
                 usb_connected,
                 daemon,
                 page,
                 last_sequence,
-                guest_snapshot,
+                health_snapshot,
             );
         }
 
@@ -447,11 +513,11 @@ where
         .stroke_color(Rgb565::WHITE)
         .stroke_width(4)
         .build();
-    Arc::new(Point::new(47, 100), 41, -45.0.deg(), 270.0.deg())
+    Arc::new(Point::new(99, 46), 41, -45.0.deg(), 270.0.deg())
         .into_styled(style)
         .draw(display)
         .ok();
-    Line::new(Point::new(67, 94), Point::new(67, 120))
+    Line::new(Point::new(119, 40), Point::new(119, 66))
         .into_styled(style)
         .draw(display)
         .ok();
@@ -499,192 +565,897 @@ fn poll_usb_connection(now: Instant, last_activity: &mut Option<Instant>) -> boo
 
 fn render<D>(
     display: &mut D,
+    framebuffer: &mut ScreenBuffer,
     usb_connected: bool,
     daemon: DaemonState,
     page: u8,
     sequence: Option<Sequence>,
-    guest_snapshot: Option<GuestSnapshot>,
+    health_snapshot: Option<HealthSnapshot>,
 ) where
     D: DrawTarget<Color = Rgb565>,
 {
     let background = Rgb565::new(1, 2, 3);
-    display.clear(background).ok();
+    framebuffer.clear(background).ok();
 
     let accent = match daemon {
-        DaemonState::Connected if usb_connected => Rgb565::GREEN,
         DaemonState::PoweringOff => Rgb565::RED,
         DaemonState::Stale => Rgb565::YELLOW,
-        DaemonState::Connected | DaemonState::Waiting => Rgb565::CYAN,
+        DaemonState::Connected => {
+            health_snapshot.map_or(Rgb565::CYAN, |snapshot| health_status(&snapshot).1)
+        }
+        DaemonState::Waiting => Rgb565::CYAN,
     };
-    Rectangle::new(Point::new(0, 0), Size::new(u32::from(DISPLAY_WIDTH), 6))
+    Rectangle::new(Point::new(0, 0), Size::new(u32::from(DISPLAY_WIDTH), 3))
         .into_styled(PrimitiveStyleBuilder::new().fill_color(accent).build())
-        .draw(display)
+        .draw(framebuffer)
         .ok();
 
-    let heading = MonoTextStyle::new(&FONT_10X20, Rgb565::WHITE);
-    let body = MonoTextStyle::new(&FONT_6X10, Rgb565::new(20, 45, 28));
-    Text::new("S3 DISPLAY", Point::new(8, 34), heading)
+    match (daemon, health_snapshot) {
+        (DaemonState::PoweringOff, _) => {
+            draw_message(
+                framebuffer,
+                "POWERING OFF",
+                "Shutdown accepted",
+                accent,
+                sequence,
+            );
+        }
+        (DaemonState::Stale, _) => {
+            draw_message(
+                framebuffer,
+                "HOST LOST",
+                "Updates stopped",
+                accent,
+                sequence,
+            );
+        }
+        (DaemonState::Connected, Some(snapshot)) => {
+            match page % 4 {
+                0 => draw_overview(framebuffer, &snapshot),
+                1 => draw_resources(framebuffer, &snapshot),
+                2 => draw_storage_network(framebuffer, &snapshot),
+                _ => draw_guests(framebuffer, &snapshot),
+            }
+            draw_page_dots(framebuffer, page % 4);
+        }
+        (DaemonState::Connected, None) => {
+            draw_message(
+                framebuffer,
+                "WAITING",
+                "No health snapshot",
+                accent,
+                sequence,
+            );
+        }
+        (DaemonState::Waiting, _) if usb_connected => {
+            draw_message(
+                framebuffer,
+                "USB READY",
+                "Start host daemon",
+                accent,
+                sequence,
+            );
+        }
+        (DaemonState::Waiting, _) => {
+            draw_message(framebuffer, "OFFLINE", "Connect USB host", accent, sequence);
+        }
+    }
+
+    Image::new(&framebuffer.as_image(), Point::zero())
         .draw(display)
         .ok();
+}
+
+fn draw_header<D>(display: &mut D, snapshot: &HealthSnapshot, title: &str, page: u8)
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let body = MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE);
+    let cyan = Rgb565::new(0, 48, 31);
+    Text::new(
+        &short_host_name(snapshot.host_name()),
+        Point::new(4, 13),
+        body,
+    )
+    .draw(display)
+    .ok();
+    Text::new(
+        title,
+        Point::new(88, 13),
+        MonoTextStyle::new(&FONT_6X10, cyan),
+    )
+    .draw(display)
+    .ok();
     let mut page_text = String::<8>::new();
-    let _ = write!(&mut page_text, "{}/2", page + 1);
-    Text::new(&page_text, Point::new(108, 31), body)
+    let _ = write!(&mut page_text, "{}/4", page + 1);
+    Text::new(&page_text, Point::new(216, 13), body)
         .draw(display)
         .ok();
+}
 
-    draw_indicator(
+fn draw_overview<D>(display: &mut D, snapshot: &HealthSnapshot)
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    draw_header(display, snapshot, "OVERVIEW", 0);
+    draw_card(display, Point::new(4, 19), Size::new(95, 103));
+    let (status, status_color) = health_status(snapshot);
+    Text::new(
+        status,
+        Point::new(12, 46),
+        MonoTextStyle::new(&FONT_10X20, status_color),
+    )
+    .draw(display)
+    .ok();
+    let mut uptime = String::<24>::new();
+    let days = snapshot.uptime_seconds / 86_400;
+    let hours = snapshot.uptime_seconds % 86_400 / 3_600;
+    let _ = write!(&mut uptime, "UP {days}d {hours}h");
+    Text::new(
+        &uptime,
+        Point::new(14, 70),
+        MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE),
+    )
+    .draw(display)
+    .ok();
+    let (running, total) = guest_counts(snapshot);
+    let mut guests = String::<16>::new();
+    let _ = write!(&mut guests, "{running}/{total}");
+    Text::new(
+        &guests,
+        Point::new(18, 103),
+        MonoTextStyle::new(&FONT_10X20, Rgb565::WHITE),
+    )
+    .draw(display)
+    .ok();
+    Text::new(
+        "RUN",
+        Point::new(61, 102),
+        MonoTextStyle::new(&FONT_6X10, status_color),
+    )
+    .draw(display)
+    .ok();
+
+    draw_card(display, Point::new(104, 19), Size::new(132, 31));
+    draw_summary_item(
         display,
-        54,
-        if usb_connected {
+        Point::new(109, 23),
+        UiIcon::Cpu,
+        "HOST",
+        &format_host_metrics(snapshot),
+        None,
+        status_color,
+    );
+    draw_card(display, Point::new(104, 55), Size::new(132, 30));
+    let address = format_ipv4(snapshot.ipv4);
+    draw_summary_item(
+        display,
+        Point::new(109, 58),
+        UiIcon::Network,
+        "LINKS",
+        &format_link(snapshot),
+        Some(&address),
+        if snapshot.network_up {
             Rgb565::GREEN
         } else {
             Rgb565::RED
         },
-        if usb_connected {
-            "USB connected"
-        } else {
-            "USB disconnected"
-        },
-        body,
     );
-    let (daemon_color, daemon_text) = match daemon {
-        DaemonState::Connected => (Rgb565::GREEN, "Daemon connected"),
-        DaemonState::Stale => (Rgb565::YELLOW, "Daemon stale"),
-        DaemonState::PoweringOff => (Rgb565::RED, "Shutdown accepted"),
-        DaemonState::Waiting => (Rgb565::RED, "Daemon disconnected"),
-    };
-    draw_indicator(display, 74, daemon_color, daemon_text, body);
+    draw_card(display, Point::new(104, 90), Size::new(132, 32));
+    let mut guest_text = String::<24>::new();
+    let _ = write!(&mut guest_text, "{running}/{total} RUN");
+    draw_summary_item(
+        display,
+        Point::new(109, 94),
+        UiIcon::Guests,
+        "GUESTS",
+        &guest_text,
+        None,
+        status_color,
+    );
+}
 
-    let (title, detail) = match daemon {
-        DaemonState::PoweringOff => ("POWERING OFF", "Clean shutdown\nwas accepted."),
-        DaemonState::Connected if usb_connected && guest_snapshot.is_some() => ("GUESTS", ""),
-        DaemonState::Connected if usb_connected => {
-            if page == 0 {
-                ("HEALTH PAGE 1", "Health data layout\nwill be added next.")
-            } else {
-                ("HEALTH PAGE 2", "Health data layout\nwill be added next.")
-            }
-        }
-        DaemonState::Stale => ("HOST LOST", "Updates stopped.\nCheck the daemon."),
-        DaemonState::Connected | DaemonState::Waiting if usb_connected => {
-            ("USB READY", "Start the Proxmox\nhost daemon.")
-        }
-        DaemonState::Connected | DaemonState::Waiting => {
-            ("OFFLINE", "Connect a USB host\nto receive data.")
-        }
-    };
-    Text::new(title, Point::new(8, 112), body)
+fn draw_resources<D>(display: &mut D, snapshot: &HealthSnapshot)
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    draw_header(display, snapshot, "RESOURCES", 1);
+    let memory = memory_percent(snapshot);
+    let mut load = String::<16>::new();
+    let _ = write!(
+        &mut load,
+        "{}.{:02}",
+        snapshot.load_average_x100 / 100,
+        snapshot.load_average_x100 % 100
+    );
+    draw_metric_card(
+        display,
+        Point::new(4, 19),
+        UiIcon::Cpu,
+        "CPU",
+        snapshot.cpu_percent,
+        "%",
+    );
+    draw_metric_card(
+        display,
+        Point::new(122, 19),
+        UiIcon::Memory,
+        "MEM",
+        memory,
+        "%",
+    );
+    draw_metric_card(
+        display,
+        Point::new(4, 72),
+        UiIcon::Io,
+        "IO PRESS",
+        snapshot.io_pressure_percent,
+        "%",
+    );
+    draw_value_card(display, Point::new(122, 72), UiIcon::Load, "LOAD", &load);
+
+    let mut memory_detail = String::<24>::new();
+    let _ = write!(
+        &mut memory_detail,
+        "{}/{}G",
+        snapshot.memory_used_mib / 1_024,
+        snapshot.memory_total_mib / 1_024
+    );
+    Text::new(
+        &memory_detail,
+        Point::new(166, 64),
+        MonoTextStyle::new(&FONT_6X10, Rgb565::new(0, 48, 31)),
+    )
+    .draw(display)
+    .ok();
+}
+
+fn draw_storage_network<D>(display: &mut D, snapshot: &HealthSnapshot)
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    draw_header(display, snapshot, "STORAGE + NET", 2);
+    let cyan = Rgb565::new(0, 48, 31);
+    let body = MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE);
+    draw_card(display, Point::new(4, 19), Size::new(114, 103));
+    draw_icon(display, UiIcon::Disk, Point::new(10, 24), cyan);
+    Text::new(
+        "STORAGE",
+        Point::new(30, 34),
+        MonoTextStyle::new(&FONT_6X10, cyan),
+    )
+    .draw(display)
+    .ok();
+    let mut root = String::<16>::new();
+    let _ = write!(&mut root, "{}%", snapshot.root_used_percent);
+    Text::new("ROOT", Point::new(10, 52), body)
         .draw(display)
         .ok();
-    for (index, line) in detail.split('\n').enumerate() {
+    Text::new(
+        &root,
+        Point::new(58, 66),
+        MonoTextStyle::new(&FONT_10X20, usage_color(snapshot.root_used_percent)),
+    )
+    .draw(display)
+    .ok();
+    draw_bar(display, Point::new(10, 75), 98, snapshot.root_used_percent);
+    Text::new("BACKUP", Point::new(10, 99), body)
+        .draw(display)
+        .ok();
+    Text::new(
+        if snapshot.backup_connected {
+            "OK"
+        } else {
+            "MISSING"
+        },
+        Point::new(64, 112),
+        MonoTextStyle::new(
+            &FONT_6X10,
+            if snapshot.backup_connected {
+                Rgb565::GREEN
+            } else {
+                Rgb565::YELLOW
+            },
+        ),
+    )
+    .draw(display)
+    .ok();
+
+    draw_card(display, Point::new(122, 19), Size::new(114, 103));
+    draw_icon(display, UiIcon::Network, Point::new(128, 24), cyan);
+    Text::new(
+        "NETWORK",
+        Point::new(148, 34),
+        MonoTextStyle::new(&FONT_6X10, cyan),
+    )
+    .draw(display)
+    .ok();
+    let link = format_link(snapshot);
+    Text::new(
+        &link,
+        Point::new(132, 65),
+        MonoTextStyle::new(
+            &FONT_10X20,
+            if snapshot.network_up {
+                Rgb565::GREEN
+            } else {
+                Rgb565::RED
+            },
+        ),
+    )
+    .draw(display)
+    .ok();
+    Text::new("IP", Point::new(128, 88), body)
+        .draw(display)
+        .ok();
+    Text::new(
+        &format_ipv4(snapshot.ipv4),
+        Point::new(128, 106),
+        MonoTextStyle::new(&FONT_6X10, cyan),
+    )
+    .draw(display)
+    .ok();
+}
+
+fn draw_guests<D>(display: &mut D, snapshot: &HealthSnapshot)
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    draw_header(display, snapshot, "GUESTS", 3);
+    let cyan = Rgb565::new(0, 48, 31);
+    let body = MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE);
+    let (running, total) = guest_counts(snapshot);
+    let mut count = String::<16>::new();
+    let _ = write!(&mut count, "{running}/{total} RUN");
+    draw_icon(display, UiIcon::Guests, Point::new(8, 20), cyan);
+    Text::new(
+        &count,
+        Point::new(28, 31),
+        MonoTextStyle::new(&FONT_6X10, Rgb565::GREEN),
+    )
+    .draw(display)
+    .ok();
+    Text::new(
+        "STATUS",
+        Point::new(143, 31),
+        MonoTextStyle::new(&FONT_6X10, cyan),
+    )
+    .draw(display)
+    .ok();
+    Text::new(
+        "CPU",
+        Point::new(207, 31),
+        MonoTextStyle::new(&FONT_6X10, cyan),
+    )
+    .draw(display)
+    .ok();
+    for (row, guest) in snapshot.guests.guests().iter().take(4).enumerate() {
+        let y = 49 + i32::try_from(row).unwrap_or(0) * 22;
+        let color = if guest.status == GuestStatus::Running {
+            Rgb565::GREEN
+        } else {
+            Rgb565::RED
+        };
+        draw_icon(
+            display,
+            match guest.kind {
+                GuestKind::VirtualMachine => UiIcon::Qemu,
+                GuestKind::Container => UiIcon::Container,
+            },
+            Point::new(5, y - 12),
+            cyan,
+        );
+        Text::new(&short_name(guest.name()), Point::new(25, y), body)
+            .draw(display)
+            .ok();
         Text::new(
-            line,
-            Point::new(8, 132 + i32::try_from(index).unwrap_or(0) * 14),
-            body,
+            if guest.status == GuestStatus::Running {
+                "RUN"
+            } else {
+                "STOP"
+            },
+            Point::new(143, y),
+            MonoTextStyle::new(&FONT_6X10, color),
+        )
+        .draw(display)
+        .ok();
+        let mut cpu = String::<8>::new();
+        let _ = write!(&mut cpu, "{}%", guest.cpu_percent);
+        Text::new(&cpu, Point::new(204, y), body).draw(display).ok();
+        if row < 3 {
+            Line::new(Point::new(8, y + 7), Point::new(231, y + 7))
+                .into_styled(
+                    PrimitiveStyleBuilder::new()
+                        .stroke_color(Rgb565::new(8, 18, 18))
+                        .build(),
+                )
+                .draw(display)
+                .ok();
+        }
+    }
+}
+
+fn draw_metric_card<D>(
+    display: &mut D,
+    origin: Point,
+    icon: UiIcon,
+    label: &str,
+    value: u8,
+    suffix: &str,
+) where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let mut text = String::<12>::new();
+    let _ = write!(&mut text, "{value}{suffix}");
+    draw_value_card(display, origin, icon, label, &text);
+}
+
+fn draw_value_card<D>(display: &mut D, origin: Point, icon: UiIcon, label: &str, value: &str)
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    draw_card(display, origin, Size::new(114, 50));
+    let cyan = Rgb565::new(0, 48, 31);
+    draw_icon(display, icon, origin + Point::new(7, 5), cyan);
+    Text::new(
+        label,
+        origin + Point::new(27, 15),
+        MonoTextStyle::new(&FONT_6X10, cyan),
+    )
+    .draw(display)
+    .ok();
+    Text::new(
+        value,
+        origin + Point::new(49, 39),
+        MonoTextStyle::new(&FONT_10X20, Rgb565::GREEN),
+    )
+    .draw(display)
+    .ok();
+}
+
+fn draw_summary_item<D>(
+    display: &mut D,
+    origin: Point,
+    icon: UiIcon,
+    label: &str,
+    value: &str,
+    detail: Option<&str>,
+    color: Rgb565,
+) where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let cyan = Rgb565::new(0, 48, 31);
+    draw_icon(display, icon, origin, cyan);
+    Text::new(
+        label,
+        origin + Point::new(20, 9),
+        MonoTextStyle::new(&FONT_6X10, cyan),
+    )
+    .draw(display)
+    .ok();
+    Text::new(
+        value,
+        origin + Point::new(56, 9),
+        MonoTextStyle::new(&FONT_6X10, color),
+    )
+    .draw(display)
+    .ok();
+    if let Some(detail) = detail {
+        Text::new(
+            detail,
+            origin + Point::new(20, 21),
+            MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE),
         )
         .draw(display)
         .ok();
     }
+}
 
-    if daemon == DaemonState::Connected
-        && usb_connected
-        && let Some(snapshot) = guest_snapshot
-    {
-        draw_guests(display, &snapshot, page, body);
+fn draw_icon<D>(display: &mut D, icon: UiIcon, origin: Point, color: Rgb565)
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let stroke = PrimitiveStyleBuilder::new()
+        .stroke_color(color)
+        .stroke_width(1)
+        .build();
+    let fill = PrimitiveStyleBuilder::new().fill_color(color).build();
+    match icon {
+        UiIcon::Cpu => {
+            Rectangle::new(origin + Point::new(3, 3), Size::new(9, 9))
+                .into_styled(stroke)
+                .draw(display)
+                .ok();
+            Rectangle::new(origin + Point::new(6, 6), Size::new(3, 3))
+                .into_styled(fill)
+                .draw(display)
+                .ok();
+            for offset in [4, 7, 10] {
+                Line::new(
+                    origin + Point::new(offset, 1),
+                    origin + Point::new(offset, 3),
+                )
+                .into_styled(stroke)
+                .draw(display)
+                .ok();
+                Line::new(
+                    origin + Point::new(offset, 12),
+                    origin + Point::new(offset, 14),
+                )
+                .into_styled(stroke)
+                .draw(display)
+                .ok();
+                Line::new(
+                    origin + Point::new(1, offset),
+                    origin + Point::new(3, offset),
+                )
+                .into_styled(stroke)
+                .draw(display)
+                .ok();
+                Line::new(
+                    origin + Point::new(12, offset),
+                    origin + Point::new(14, offset),
+                )
+                .into_styled(stroke)
+                .draw(display)
+                .ok();
+            }
+        }
+        UiIcon::Memory => {
+            Rectangle::new(origin + Point::new(1, 3), Size::new(14, 9))
+                .into_styled(stroke)
+                .draw(display)
+                .ok();
+            for x in [3, 7, 11] {
+                Rectangle::new(origin + Point::new(x, 5), Size::new(3, 4))
+                    .into_styled(fill)
+                    .draw(display)
+                    .ok();
+            }
+            for x in [3, 6, 9, 12] {
+                Line::new(origin + Point::new(x, 12), origin + Point::new(x, 14))
+                    .into_styled(stroke)
+                    .draw(display)
+                    .ok();
+            }
+        }
+        UiIcon::Disk => {
+            Rectangle::new(origin + Point::new(2, 1), Size::new(12, 14))
+                .into_styled(stroke)
+                .draw(display)
+                .ok();
+            for y in [5, 10] {
+                Line::new(origin + Point::new(2, y), origin + Point::new(13, y))
+                    .into_styled(stroke)
+                    .draw(display)
+                    .ok();
+            }
+            Rectangle::new(origin + Point::new(10, 12), Size::new(2, 2))
+                .into_styled(fill)
+                .draw(display)
+                .ok();
+        }
+        UiIcon::Network => {
+            Rectangle::new(origin + Point::new(5, 5), Size::new(6, 5))
+                .into_styled(stroke)
+                .draw(display)
+                .ok();
+            for (start, end) in [
+                (Point::new(8, 5), Point::new(8, 2)),
+                (Point::new(5, 8), Point::new(2, 8)),
+                (Point::new(11, 8), Point::new(14, 8)),
+                (Point::new(8, 10), Point::new(8, 13)),
+            ] {
+                Line::new(origin + start, origin + end)
+                    .into_styled(stroke)
+                    .draw(display)
+                    .ok();
+            }
+            for point in [
+                Point::new(6, 0),
+                Point::new(0, 6),
+                Point::new(13, 6),
+                Point::new(6, 13),
+            ] {
+                Rectangle::new(origin + point, Size::new(4, 3))
+                    .into_styled(fill)
+                    .draw(display)
+                    .ok();
+            }
+        }
+        UiIcon::Guests => {
+            Rectangle::new(origin + Point::new(1, 1), Size::new(14, 10))
+                .into_styled(stroke)
+                .draw(display)
+                .ok();
+            Line::new(origin + Point::new(5, 13), origin + Point::new(11, 13))
+                .into_styled(stroke)
+                .draw(display)
+                .ok();
+            Line::new(origin + Point::new(8, 11), origin + Point::new(8, 13))
+                .into_styled(stroke)
+                .draw(display)
+                .ok();
+        }
+        UiIcon::Qemu => {
+            Rectangle::new(origin + Point::new(1, 1), Size::new(14, 10))
+                .into_styled(stroke)
+                .draw(display)
+                .ok();
+            Rectangle::new(origin + Point::new(4, 4), Size::new(2, 2))
+                .into_styled(fill)
+                .draw(display)
+                .ok();
+            Rectangle::new(origin + Point::new(8, 4), Size::new(2, 2))
+                .into_styled(fill)
+                .draw(display)
+                .ok();
+            Line::new(origin + Point::new(5, 13), origin + Point::new(11, 13))
+                .into_styled(stroke)
+                .draw(display)
+                .ok();
+            Line::new(origin + Point::new(8, 11), origin + Point::new(8, 13))
+                .into_styled(stroke)
+                .draw(display)
+                .ok();
+        }
+        UiIcon::Container => {
+            Rectangle::new(origin + Point::new(1, 2), Size::new(14, 12))
+                .into_styled(stroke)
+                .draw(display)
+                .ok();
+            Line::new(origin + Point::new(1, 6), origin + Point::new(14, 6))
+                .into_styled(stroke)
+                .draw(display)
+                .ok();
+            Line::new(origin + Point::new(5, 2), origin + Point::new(5, 14))
+                .into_styled(stroke)
+                .draw(display)
+                .ok();
+            Line::new(origin + Point::new(10, 2), origin + Point::new(10, 14))
+                .into_styled(stroke)
+                .draw(display)
+                .ok();
+        }
+        UiIcon::Io => {
+            Line::new(origin + Point::new(4, 13), origin + Point::new(4, 2))
+                .into_styled(stroke)
+                .draw(display)
+                .ok();
+            Line::new(origin + Point::new(4, 2), origin + Point::new(1, 5))
+                .into_styled(stroke)
+                .draw(display)
+                .ok();
+            Line::new(origin + Point::new(4, 2), origin + Point::new(7, 5))
+                .into_styled(stroke)
+                .draw(display)
+                .ok();
+            Line::new(origin + Point::new(11, 2), origin + Point::new(11, 13))
+                .into_styled(stroke)
+                .draw(display)
+                .ok();
+            Line::new(origin + Point::new(11, 13), origin + Point::new(8, 10))
+                .into_styled(stroke)
+                .draw(display)
+                .ok();
+            Line::new(origin + Point::new(11, 13), origin + Point::new(14, 10))
+                .into_styled(stroke)
+                .draw(display)
+                .ok();
+        }
+        UiIcon::Load => {
+            Line::new(origin + Point::new(1, 1), origin + Point::new(1, 14))
+                .into_styled(stroke)
+                .draw(display)
+                .ok();
+            Line::new(origin + Point::new(1, 14), origin + Point::new(15, 14))
+                .into_styled(stroke)
+                .draw(display)
+                .ok();
+            for (start, end) in [
+                (Point::new(2, 11), Point::new(6, 7)),
+                (Point::new(6, 7), Point::new(9, 9)),
+                (Point::new(9, 9), Point::new(14, 3)),
+            ] {
+                Line::new(origin + start, origin + end)
+                    .into_styled(stroke)
+                    .draw(display)
+                    .ok();
+            }
+        }
     }
+}
 
-    if daemon == DaemonState::Connected && usb_connected && guest_snapshot.is_some() {
-        Text::new("Press: next  Hold: off", Point::new(8, 224), body)
-            .draw(display)
-            .ok();
-    } else {
-        let mut sequence_text = String::<32>::new();
-        match sequence {
-            Some(value) => write!(&mut sequence_text, "Update #{value}").ok(),
-            None => sequence_text.push_str("No host data yet").ok(),
-        };
-        Text::new(&sequence_text, Point::new(8, 174), body)
-            .draw(display)
-            .ok();
+fn draw_card<D>(display: &mut D, origin: Point, size: Size)
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    Rectangle::new(origin, size)
+        .into_styled(
+            PrimitiveStyleBuilder::new()
+                .stroke_color(Rgb565::new(12, 25, 24))
+                .stroke_width(1)
+                .build(),
+        )
+        .draw(display)
+        .ok();
+}
 
-        let copy = if usb_connected && daemon == DaemonState::Connected {
-            "Press: next screen\nHold 2s: shutdown"
-        } else {
-            "Press: next screen\nShutdown needs host"
-        };
-        for (index, line) in copy.split('\n').enumerate() {
-            Text::new(
-                line,
-                Point::new(8, 205 + i32::try_from(index).unwrap_or(0) * 14),
-                body,
+fn draw_bar<D>(display: &mut D, origin: Point, width: u32, percent: u8)
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    Rectangle::new(origin, Size::new(width, 6))
+        .into_styled(
+            PrimitiveStyleBuilder::new()
+                .stroke_color(Rgb565::new(12, 25, 24))
+                .stroke_width(1)
+                .build(),
+        )
+        .draw(display)
+        .ok();
+    let filled = width.saturating_sub(2) * u32::from(percent) / 100;
+    if filled > 0 {
+        Rectangle::new(origin + Point::new(1, 1), Size::new(filled, 4))
+            .into_styled(
+                PrimitiveStyleBuilder::new()
+                    .fill_color(usage_color(percent))
+                    .build(),
             )
             .draw(display)
             .ok();
-        }
     }
 }
 
-fn draw_guests<D>(
-    display: &mut D,
-    snapshot: &GuestSnapshot,
-    page: u8,
-    text_style: MonoTextStyle<'_, Rgb565>,
-) where
+fn draw_page_dots<D>(display: &mut D, page: u8)
+where
     D: DrawTarget<Color = Rgb565>,
 {
-    let start = usize::from(page) * 3;
-    for (row, guest) in snapshot.guests().iter().skip(start).take(3).enumerate() {
-        let mut heading = String::<32>::new();
-        let kind = match guest.kind {
-            GuestKind::VirtualMachine => "VM",
-            GuestKind::Container => "CT",
-        };
-        let _ = write!(&mut heading, "{} {kind} {}", guest.vmid, guest.name());
-        Text::new(
-            &heading,
-            Point::new(8, 126 + i32::try_from(row).unwrap_or(0) * 26),
-            text_style,
-        )
-        .draw(display)
-        .ok();
-
-        let mut metrics = String::<32>::new();
-        match guest.status {
-            GuestStatus::Running => {
-                let _ = write!(
-                    &mut metrics,
-                    " RUN {}% {}/{}M",
-                    guest.cpu_percent, guest.memory_used_mib, guest.memory_total_mib
-                );
-            }
-            GuestStatus::Stopped => {
-                let _ = metrics.push_str(" STOPPED");
-            }
-        }
-        Text::new(
-            &metrics,
-            Point::new(8, 138 + i32::try_from(row).unwrap_or(0) * 26),
-            text_style,
-        )
-        .draw(display)
-        .ok();
+    for index in 0..4_i32 {
+        Rectangle::new(Point::new(105 + index * 10, 129), Size::new(5, 3))
+            .into_styled(
+                PrimitiveStyleBuilder::new()
+                    .fill_color(if index == i32::from(page) {
+                        Rgb565::GREEN
+                    } else {
+                        Rgb565::new(14, 22, 20)
+                    })
+                    .build(),
+            )
+            .draw(display)
+            .ok();
     }
 }
 
-fn draw_indicator<D>(
+fn draw_message<D>(
     display: &mut D,
-    y: i32,
+    title: &str,
+    detail: &str,
     color: Rgb565,
-    label: &str,
-    text_style: MonoTextStyle<'_, Rgb565>,
+    sequence: Option<Sequence>,
 ) where
     D: DrawTarget<Color = Rgb565>,
 {
-    Rectangle::new(Point::new(8, y - 7), Size::new(8, 8))
-        .into_styled(PrimitiveStyleBuilder::new().fill_color(color).build())
-        .draw(display)
-        .ok();
-    Text::new(label, Point::new(22, y), text_style)
-        .draw(display)
-        .ok();
+    Text::new(
+        title,
+        Point::new(20, 55),
+        MonoTextStyle::new(&FONT_10X20, color),
+    )
+    .draw(display)
+    .ok();
+    Text::new(
+        detail,
+        Point::new(22, 79),
+        MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE),
+    )
+    .draw(display)
+    .ok();
+    let mut update = String::<24>::new();
+    match sequence {
+        Some(value) => write!(&mut update, "LAST UPDATE #{value}").ok(),
+        None => update.push_str("NO HOST DATA").ok(),
+    };
+    Text::new(
+        &update,
+        Point::new(22, 101),
+        MonoTextStyle::new(&FONT_6X10, Rgb565::new(14, 28, 24)),
+    )
+    .draw(display)
+    .ok();
+}
+
+fn health_status(snapshot: &HealthSnapshot) -> (&'static str, Rgb565) {
+    let memory = memory_percent(snapshot);
+    if !snapshot.network_up || snapshot.root_used_percent >= 95 {
+        ("CRITICAL", Rgb565::RED)
+    } else if !snapshot.backup_connected
+        || snapshot.cpu_percent >= 85
+        || memory >= 90
+        || snapshot.io_pressure_percent >= 50
+        || snapshot.root_used_percent >= 85
+    {
+        ("WARNING", Rgb565::YELLOW)
+    } else {
+        ("HEALTHY", Rgb565::GREEN)
+    }
+}
+
+fn usage_color(percent: u8) -> Rgb565 {
+    if percent >= 95 {
+        Rgb565::RED
+    } else if percent >= 85 {
+        Rgb565::YELLOW
+    } else {
+        Rgb565::GREEN
+    }
+}
+
+fn memory_percent(snapshot: &HealthSnapshot) -> u8 {
+    if snapshot.memory_total_mib == 0 {
+        0
+    } else {
+        u8::try_from(
+            u64::from(snapshot.memory_used_mib).saturating_mul(100)
+                / u64::from(snapshot.memory_total_mib),
+        )
+        .unwrap_or(100)
+    }
+}
+
+fn guest_counts(snapshot: &HealthSnapshot) -> (usize, usize) {
+    let guests = snapshot.guests.guests();
+    (
+        guests
+            .iter()
+            .filter(|guest| guest.status == GuestStatus::Running)
+            .count(),
+        guests.len(),
+    )
+}
+
+fn format_host_metrics(snapshot: &HealthSnapshot) -> String<48> {
+    let mut text = String::new();
+    let _ = write!(
+        &mut text,
+        "{}% / {}%",
+        snapshot.cpu_percent,
+        memory_percent(snapshot)
+    );
+    text
+}
+
+fn format_link(snapshot: &HealthSnapshot) -> String<24> {
+    let mut text = String::new();
+    if !snapshot.network_up {
+        let _ = text.push_str("DOWN");
+    } else if snapshot.network_mbps >= 1_000 {
+        let _ = write!(&mut text, "{}G UP", snapshot.network_mbps / 1_000);
+    } else if snapshot.network_mbps > 0 {
+        let _ = write!(&mut text, "{}M UP", snapshot.network_mbps);
+    } else {
+        let _ = text.push_str("UP");
+    }
+    text
+}
+
+fn format_ipv4(address: [u8; 4]) -> String<16> {
+    let mut text = String::new();
+    if address == [0; 4] {
+        let _ = text.push_str("NO ADDRESS");
+    } else {
+        let _ = write!(
+            &mut text,
+            "{}.{}.{}.{}",
+            address[0], address[1], address[2], address[3]
+        );
+    }
+    text
+}
+
+fn short_name(name: &str) -> String<17> {
+    name.chars().take(16).collect()
+}
+
+fn short_host_name(name: &str) -> String<11> {
+    name.chars().take(10).collect()
 }
