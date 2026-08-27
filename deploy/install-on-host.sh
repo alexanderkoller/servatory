@@ -17,60 +17,39 @@ cleanup_remote() {
 trap cleanup_remote EXIT
 
 if [[ $(id -u) -eq 0 ]]; then
-    privilege=()
-elif command -v sudo >/dev/null 2>&1; then
-    echo "Administrator access is required to install and start the service."
-    sudo -v
-    privilege=(sudo)
-else
-    echo "Run the installer as root or install sudo on the Proxmox host." >&2
+    echo "Refusing to deploy as root." >&2
+    echo "Run this installer through a regular account with sudo access." >&2
+    exit 1
+fi
+if ! command -v sudo >/dev/null 2>&1; then
+    echo "The remote account needs sudo access to install the service." >&2
     exit 1
 fi
 
-install_packages=()
-command -v cc >/dev/null 2>&1 || install_packages+=(build-essential)
-command -v curl >/dev/null 2>&1 || install_packages+=(curl ca-certificates)
-
-if ((${#install_packages[@]})); then
-    if ! command -v apt-get >/dev/null 2>&1; then
-        echo "Missing build tools, and this host does not provide apt-get." >&2
+for required_file in s3-display-host 99-m5stick-s3.rules s3-display.service; do
+    if [[ ! -f "$install_dir/$required_file" ]]; then
+        echo "Missing uploaded file: $required_file" >&2
         exit 1
     fi
-    echo "Installing build prerequisites..."
-    "${privilege[@]}" apt-get update
-    "${privilege[@]}" apt-get install -y "${install_packages[@]}"
+done
+
+chmod 0755 "$install_dir/s3-display-host"
+if ! "$install_dir/s3-display-host" --help >/dev/null; then
+    echo "The uploaded daemon cannot run on this server." >&2
+    exit 1
 fi
 
-source_dir=$install_dir/source
-mkdir "$source_dir"
-tar -C "$source_dir" -xzf "$install_dir/source.tar.gz"
-
-cargo_command=()
-if command -v cargo >/dev/null 2>&1 && command -v rustc >/dev/null 2>&1; then
-    rust_version=$(rustc --version | awk '{print $2}')
-    if printf '%s\n%s\n' 1.85.0 "$rust_version" | sort -V -C; then
-        cargo_command=(cargo)
-    fi
-fi
-
-if ((${#cargo_command[@]} == 0)); then
-    echo "Installing a current Rust toolchain for the build user..."
-    rustup_installer=$install_dir/rustup-init.sh
-    curl --proto '=https' --tlsv1.2 -fsS https://sh.rustup.rs -o "$rustup_installer"
-    sh "$rustup_installer" -y --profile minimal --default-toolchain stable
-    cargo_command=("$HOME/.cargo/bin/cargo" +stable)
-fi
-
-echo "Building s3-display-host..."
-(cd "$source_dir" && "${cargo_command[@]}" build --locked --release -p s3-display-host)
+echo "Installing as $(id -un); sudo is used only for system changes."
+sudo -v
+privilege=(sudo)
 
 echo "Installing systemd service and udev rule..."
 "${privilege[@]}" install -m 0755 \
-    "$source_dir/target/release/s3-display-host" /usr/local/bin/s3-display-host
+    "$install_dir/s3-display-host" /usr/local/bin/s3-display-host
 "${privilege[@]}" install -m 0644 \
-    "$source_dir/deploy/99-m5stick-s3.rules" /etc/udev/rules.d/99-m5stick-s3.rules
+    "$install_dir/99-m5stick-s3.rules" /etc/udev/rules.d/99-m5stick-s3.rules
 "${privilege[@]}" install -m 0644 \
-    "$source_dir/deploy/s3-display.service" /etc/systemd/system/s3-display.service
+    "$install_dir/s3-display.service" /etc/systemd/system/s3-display.service
 
 "${privilege[@]}" udevadm control --reload-rules
 "${privilege[@]}" systemctl daemon-reload

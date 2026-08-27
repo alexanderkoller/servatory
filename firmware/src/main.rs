@@ -305,9 +305,9 @@ fn main() -> ! {
                 Ok(HostMessage::Update { sequence, .. }) => {
                     last_update = Some(now);
                     last_sequence = Some(sequence);
-                    if daemon != DaemonState::PoweringOff {
-                        daemon = DaemonState::Connected;
-                    }
+                    // ShutdownAccepted is terminal only for the old host session.
+                    // A subsequent valid update proves that the host is running again.
+                    daemon = DaemonState::Connected;
                     usb_tx.enqueue(DeviceMessage::Ack { sequence });
                     if !shutdown_animation_active {
                         render(
@@ -324,9 +324,7 @@ fn main() -> ! {
                 Ok(HostMessage::GuestSnapshot { sequence, .. }) => {
                     last_update = Some(now);
                     last_sequence = Some(sequence);
-                    if daemon != DaemonState::PoweringOff {
-                        daemon = DaemonState::Connected;
-                    }
+                    daemon = DaemonState::Connected;
                     usb_tx.enqueue(DeviceMessage::Ack { sequence });
                     if !shutdown_animation_active {
                         render(
@@ -346,9 +344,7 @@ fn main() -> ! {
                     last_update = Some(now);
                     last_sequence = Some(sequence);
                     health_snapshot = Some(snapshot);
-                    if daemon != DaemonState::PoweringOff {
-                        daemon = DaemonState::Connected;
-                    }
+                    daemon = DaemonState::Connected;
                     usb_tx.enqueue(DeviceMessage::Ack { sequence });
                     if !shutdown_animation_active {
                         render(

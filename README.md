@@ -19,7 +19,8 @@ may be used by the application runtime.
 The display boots and remains responsive without a USB host or daemon. Its
 offline view distinguishes physical USB activity from a validated daemon
 session. All USB transmission is non-blocking, and shutdown requests are never
-queued across disconnected sessions.
+queued across disconnected sessions. After an accepted shutdown, the first
+valid update from the rebooted host returns the display to its normal status.
 
 The front button changes between four health screens on a short press. Holding it
 for three seconds during a live daemon session sends a shutdown request. The host
@@ -59,6 +60,19 @@ does not open a text monitor because the application uses the same USB
 Serial/JTAG interface for its binary protocol. The interface appears on Linux as
 a CDC-ACM serial device. There is no meaningful baud rate for this hardware
 interface; 115200 is specified for compatibility with serial APIs.
+
+To build locally and reflash a Stick that remains attached to the Proxmox server,
+use the deployment script with a regular SSH account:
+
+```sh
+./deploy/flash-firmware.sh alex@192.168.1.50
+```
+
+The script builds the firmware on the Mac, downloads and verifies the official
+Linux `espflash` release, and uploads both to a temporary directory. On Proxmox,
+it temporarily stops and runtime-masks the display service so it cannot seize the
+USB device during resets, flashes `/dev/m5stick-s3`, restores the service, and
+removes the temporary files. Rust and `espflash` are not installed on the server.
 
 For the first flash from the factory UiFlow2 firmware, manually enter download
 mode by holding the StickS3 side reset button for about two seconds and releasing
@@ -103,15 +117,23 @@ shutdown command.
 Enable SSH on the Proxmox host, then run this from the repository on your Mac:
 
 ```sh
-./deploy/install-remote.sh root@pve.local
+./deploy/install-remote.sh alex@pve.local
 ```
 
-Replace `pve.local` with the server's hostname or IP address. The installer uses
-SSH to copy the small host workspace, builds it on Proxmox, installs the daemon,
-udev rule, and systemd unit, and enables the service. If you connect as a non-root
-user, it uses `sudo` and may ask for that user's password. A current Rust toolchain
-is installed for the remote build user only when the server does not already have
-a sufficiently recent one.
+Replace `alex` with your regular server account and `pve.local` with the server's
+hostname or IP address. Root SSH is deliberately rejected. The installer detects
+whether the server is x86_64 or AArch64, cross-compiles a static Linux binary on
+the Mac with Zig, and uploads only that binary and the deployment files. The
+server does not need Rust, a compiler, or build packages. The installer uses
+`sudo` only to copy files into system locations and reload or start udev/systemd;
+it may ask for the account's sudo password.
+
+The Mac needs Zig and cargo-zigbuild:
+
+```sh
+brew install zig
+cargo install cargo-zigbuild
+```
 
 The M5Stick must remain plugged into the Proxmox server, not the Mac. If it is
 already connected, the installer starts the daemon immediately; otherwise udev
@@ -120,15 +142,16 @@ starts it when the display is plugged in.
 To check it later:
 
 ```sh
-ssh root@pve.local systemctl status s3-display.service
+ssh alex@pve.local systemctl status s3-display.service
 ```
 
-### Directly on Proxmox
+### Manual installation on Proxmox
 
-Build the host binary on the Proxmox machine (or cross-compile it), then install:
+If you already have the matching static Linux binary, copy it to the Proxmox
+machine along with `deploy/`, then install it without any server-side build:
 
 ```sh
-sudo install -m 0755 target/release/s3-display-host /usr/local/bin/
+sudo install -m 0755 s3-display-host /usr/local/bin/
 sudo install -m 0644 deploy/99-m5stick-s3.rules /etc/udev/rules.d/
 sudo install -m 0644 deploy/s3-display.service /etc/systemd/system/
 sudo udevadm control --reload
