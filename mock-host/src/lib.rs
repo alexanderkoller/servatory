@@ -1,7 +1,9 @@
 use std::io::{self, Write};
 
 use s3_display_host::Shutdown;
-use s3_display_protocol::{GuestKind, GuestSnapshot, GuestStatus, GuestSummary, HealthSnapshot};
+use s3_display_protocol::{
+    GuestKind, GuestSnapshot, GuestStatus, GuestSummary, HealthSnapshot, InternetStatus,
+};
 
 pub struct ConsoleShutdown<W> {
     output: W,
@@ -97,7 +99,10 @@ pub fn made_up_health() -> HealthSnapshot {
         72,
         true,
         true,
-        1_000,
+        2_500,
+        "enp3s0",
+        InternetStatus::Reachable,
+        Some(0),
         [10, 0, 0, 12],
         made_up_guests(),
     )
@@ -153,6 +158,9 @@ mod tests {
         assert_eq!(health.host_name(), "pve-01");
         assert_eq!(health.cpu_percent, 23);
         assert!(health.network_up);
+        assert_eq!(health.network_mbps, 2_500);
+        assert_eq!(health.network_interface(), "enp3s0");
+        assert_eq!(health.internet_status, InternetStatus::Reachable);
         assert!(health.backup_connected);
         assert_eq!(health.guests.guests().len(), 5);
     }

@@ -34,7 +34,7 @@ use mipidsi::{
 };
 use s3_display_protocol::{
     ButtonAction, DeviceMessage, FrameDecoder, GuestKind, GuestStatus, HealthSnapshot, HostMessage,
-    MAX_FRAME_LEN, decode_host, encode_device,
+    InternetStatus, MAX_FRAME_LEN, decode_host, encode_device,
 };
 use static_cell::StaticCell;
 
@@ -657,6 +657,22 @@ where
     )
     .draw(display)
     .ok();
+    if status == "CRITICAL" {
+        Text::new(
+            "CAUSE",
+            Point::new(12, 91),
+            MonoTextStyle::new(&FONT_6X10, Rgb565::new(0, 48, 31)),
+        )
+        .draw(display)
+        .ok();
+        Text::new(
+            &critical_cause(snapshot),
+            Point::new(12, 108),
+            MonoTextStyle::new(&FONT_6X10, Rgb565::RED),
+        )
+        .draw(display)
+        .ok();
+    }
     let (running, total) = guest_counts(snapshot);
 
     draw_card(display, Point::new(104, 19), Size::new(132, 31));
@@ -666,22 +682,18 @@ where
         UiIcon::Cpu,
         "HOST",
         &format_host_metrics(snapshot),
-        status_color,
+        resource_status_color(snapshot),
     );
     draw_card(display, Point::new(104, 55), Size::new(132, 30));
-    let address = format_ipv4(snapshot.ipv4);
+    let network_detail = format_network_summary(snapshot);
     draw_summary_item(
         display,
         Point::new(109, 58),
         UiIcon::Network,
-        "LINKS",
+        "NET",
         &format_link(snapshot),
-        Some(&address),
-        if snapshot.network_up {
-            Rgb565::GREEN
-        } else {
-            Rgb565::RED
-        },
+        Some(&network_detail),
+        network_color(snapshot),
     );
     draw_card(display, Point::new(104, 90), Size::new(132, 32));
     let mut guest_text = String::<24>::new();
@@ -692,7 +704,7 @@ where
         UiIcon::Guests,
         "GUESTS",
         &guest_text,
-        status_color,
+        Rgb565::GREEN,
     );
 }
 
@@ -813,31 +825,55 @@ where
     )
     .draw(display)
     .ok();
-    let link = format_link(snapshot);
     Text::new(
-        &link,
-        Point::new(132, 65),
-        MonoTextStyle::new(
-            &FONT_10X20,
-            if snapshot.network_up {
-                Rgb565::GREEN
-            } else {
-                Rgb565::RED
-            },
-        ),
+        if snapshot.network_interface().is_empty() {
+            "NO INTERFACE"
+        } else {
+            snapshot.network_interface()
+        },
+        Point::new(128, 48),
+        MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE),
     )
     .draw(display)
     .ok();
-    Text::new("IP", Point::new(128, 88), body)
+    let show_last_success = network_has_error(snapshot);
+    let link_y = if show_last_success { 68 } else { 78 };
+    let status_y = if show_last_success { 82 } else { 92 };
+    let ip_y = if show_last_success { 96 } else { 108 };
+    let link = format_link(snapshot);
+    Text::new(
+        &link,
+        Point::new(128, link_y),
+        MonoTextStyle::new(&FONT_10X20, network_color(snapshot)),
+    )
+    .draw(display)
+    .ok();
+    Text::new(
+        network_status_text(snapshot),
+        Point::new(128, status_y),
+        MonoTextStyle::new(&FONT_6X10, network_color(snapshot)),
+    )
+    .draw(display)
+    .ok();
+    Text::new("IP", Point::new(128, ip_y), body)
         .draw(display)
         .ok();
     Text::new(
         &format_ipv4(snapshot.ipv4),
-        Point::new(128, 106),
+        Point::new(146, ip_y),
         MonoTextStyle::new(&FONT_6X10, cyan),
     )
     .draw(display)
     .ok();
+    if show_last_success {
+        Text::new(
+            &format_last_internet_success(snapshot.last_internet_success_age_seconds),
+            Point::new(128, 112),
+            MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE),
+        )
+        .draw(display)
+        .ok();
+    }
 }
 
 fn draw_guests<D>(display: &mut D, snapshot: &HealthSnapshot, guest_page: u8)
@@ -1337,9 +1373,13 @@ where
 
 fn health_status(snapshot: &HealthSnapshot) -> (&'static str, Rgb565) {
     let memory = memory_percent(snapshot);
-    if !snapshot.network_up || snapshot.root_used_percent >= 95 {
+    if !snapshot.network_up
+        || snapshot.internet_status == InternetStatus::Failed
+        || snapshot.root_used_percent >= 95
+    {
         ("CRITICAL", Rgb565::RED)
     } else if !snapshot.backup_connected
+        || snapshot.internet_status == InternetStatus::Missed
         || snapshot.cpu_percent >= 85
         || memory >= 90
         || snapshot.io_pressure_percent >= 50
@@ -1349,6 +1389,22 @@ fn health_status(snapshot: &HealthSnapshot) -> (&'static str, Rgb565) {
     } else {
         ("HEALTHY", Rgb565::GREEN)
     }
+}
+
+fn critical_cause(snapshot: &HealthSnapshot) -> String<16> {
+    let mut cause = String::new();
+    if !snapshot.network_up {
+        let _ = cause.push_str("LINK DOWN");
+    } else if snapshot.internet_status == InternetStatus::Failed {
+        let _ = cause.push_str("PING FAILED");
+    } else if snapshot.root_used_percent >= 95 {
+        let _ = write!(&mut cause, "ROOT {}% FULL", snapshot.root_used_percent);
+    }
+    cause
+}
+
+fn resource_status_color(snapshot: &HealthSnapshot) -> Rgb565 {
+    usage_color(snapshot.cpu_percent.max(memory_percent(snapshot)))
 }
 
 fn usage_color(percent: u8) -> Rgb565 {
@@ -1400,11 +1456,89 @@ fn format_link(snapshot: &HealthSnapshot) -> String<24> {
     if !snapshot.network_up {
         let _ = text.push_str("DOWN");
     } else if snapshot.network_mbps >= 1_000 {
-        let _ = write!(&mut text, "{}G UP", snapshot.network_mbps / 1_000);
+        let gigabits = snapshot.network_mbps / 1_000;
+        let remainder = snapshot.network_mbps % 1_000;
+        if remainder == 0 {
+            let _ = write!(&mut text, "{gigabits}G UP");
+        } else {
+            let _ = write!(&mut text, "{gigabits}.{}G UP", remainder / 100);
+        }
     } else if snapshot.network_mbps > 0 {
         let _ = write!(&mut text, "{}M UP", snapshot.network_mbps);
     } else {
         let _ = text.push_str("UP");
+    }
+    text
+}
+
+fn network_color(snapshot: &HealthSnapshot) -> Rgb565 {
+    if !snapshot.network_up || snapshot.internet_status == InternetStatus::Failed {
+        Rgb565::RED
+    } else if snapshot.internet_status == InternetStatus::Missed {
+        Rgb565::YELLOW
+    } else {
+        Rgb565::GREEN
+    }
+}
+
+fn network_has_error(snapshot: &HealthSnapshot) -> bool {
+    !snapshot.network_up
+        || matches!(
+            snapshot.internet_status,
+            InternetStatus::Missed | InternetStatus::Failed
+        )
+}
+
+fn network_status_text(snapshot: &HealthSnapshot) -> &'static str {
+    if !snapshot.network_up {
+        "LINK DOWN"
+    } else {
+        internet_status_text(snapshot.internet_status)
+    }
+}
+
+const fn internet_status_text(status: InternetStatus) -> &'static str {
+    match status {
+        InternetStatus::Checking => "CHECKING",
+        InternetStatus::Reachable => "ONLINE",
+        InternetStatus::Missed => "PING MISSED",
+        InternetStatus::Failed => "PING FAILED",
+    }
+}
+
+fn format_network_summary(snapshot: &HealthSnapshot) -> String<16> {
+    if !snapshot.network_up {
+        let mut text = String::new();
+        let _ = text.push_str("LINK DOWN");
+        return text;
+    }
+    if snapshot.internet_status == InternetStatus::Reachable {
+        return format_ipv4(snapshot.ipv4);
+    }
+    let mut text = String::new();
+    let _ = text.push_str(internet_status_text(snapshot.internet_status));
+    text
+}
+
+fn format_last_internet_success(age_seconds: Option<u32>) -> String<20> {
+    let mut text = String::new();
+    let Some(seconds) = age_seconds else {
+        let _ = text.push_str("LAST OK NEVER");
+        return text;
+    };
+    if seconds < 60 {
+        let _ = write!(&mut text, "LAST OK {seconds}s AGO");
+    } else if seconds < 3_600 {
+        let _ = write!(&mut text, "LAST OK {}m AGO", seconds / 60);
+    } else if seconds < 86_400 {
+        let _ = write!(
+            &mut text,
+            "LAST OK {}h{}m AGO",
+            seconds / 3_600,
+            seconds % 3_600 / 60
+        );
+    } else {
+        let _ = write!(&mut text, "LAST OK {}d AGO", seconds / 86_400);
     }
     text
 }

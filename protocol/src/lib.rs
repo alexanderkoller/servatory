@@ -4,12 +4,13 @@ use core::fmt;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
 /// Maximum COBS-encoded frame size, including its trailing zero delimiter.
 pub const MAX_FRAME_LEN: usize = 512;
 pub const MAX_GUESTS: usize = 8;
 pub const MAX_GUEST_NAME_LEN: usize = 20;
 pub const MAX_HOST_NAME_LEN: usize = 20;
+pub const MAX_NETWORK_INTERFACE_LEN: usize = 15;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[repr(transparent)]
@@ -66,6 +67,14 @@ pub enum GuestKind {
 pub enum GuestStatus {
     Running,
     Stopped,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum InternetStatus {
+    Checking,
+    Reachable,
+    Missed,
+    Failed,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -181,10 +190,14 @@ pub struct HealthSnapshot {
     pub backup_connected: bool,
     pub network_up: bool,
     pub network_mbps: u16,
+    pub internet_status: InternetStatus,
+    pub last_internet_success_age_seconds: Option<u32>,
     pub ipv4: [u8; 4],
     pub guests: GuestSnapshot,
     host_name_len: u8,
     host_name: [u8; MAX_HOST_NAME_LEN],
+    network_interface_len: u8,
+    network_interface: [u8; MAX_NETWORK_INTERFACE_LEN],
 }
 
 impl HealthSnapshot {
@@ -192,7 +205,7 @@ impl HealthSnapshot {
     ///
     /// # Errors
     ///
-    /// Returns [`HostNameError::TooLong`] when the UTF-8 name exceeds the wire limit.
+    /// Returns [`HealthSnapshotError`] when either name exceeds its wire limit.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         host_name: &str,
@@ -206,14 +219,22 @@ impl HealthSnapshot {
         backup_connected: bool,
         network_up: bool,
         network_mbps: u16,
+        network_interface: &str,
+        internet_status: InternetStatus,
+        last_internet_success_age_seconds: Option<u32>,
         ipv4: [u8; 4],
         guests: GuestSnapshot,
-    ) -> Result<Self, HostNameError> {
+    ) -> Result<Self, HealthSnapshotError> {
         if host_name.len() > MAX_HOST_NAME_LEN {
-            return Err(HostNameError::TooLong);
+            return Err(HealthSnapshotError::HostNameTooLong);
+        }
+        if network_interface.len() > MAX_NETWORK_INTERFACE_LEN {
+            return Err(HealthSnapshotError::NetworkInterfaceTooLong);
         }
         let mut bytes = [0; MAX_HOST_NAME_LEN];
         bytes[..host_name.len()].copy_from_slice(host_name.as_bytes());
+        let mut interface_bytes = [0; MAX_NETWORK_INTERFACE_LEN];
+        interface_bytes[..network_interface.len()].copy_from_slice(network_interface.as_bytes());
         Ok(Self {
             uptime_seconds,
             cpu_percent: cpu_percent.min(100),
@@ -225,10 +246,14 @@ impl HealthSnapshot {
             backup_connected,
             network_up,
             network_mbps,
+            internet_status,
+            last_internet_success_age_seconds,
             ipv4,
             guests,
             host_name_len: u8::try_from(host_name.len()).unwrap_or(0),
             host_name: bytes,
+            network_interface_len: u8::try_from(network_interface.len()).unwrap_or(0),
+            network_interface: interface_bytes,
         })
     }
 
@@ -237,16 +262,29 @@ impl HealthSnapshot {
         let len = usize::from(self.host_name_len).min(MAX_HOST_NAME_LEN);
         core::str::from_utf8(&self.host_name[..len]).unwrap_or("?")
     }
+
+    #[must_use]
+    pub fn network_interface(&self) -> &str {
+        let len = usize::from(self.network_interface_len).min(MAX_NETWORK_INTERFACE_LEN);
+        core::str::from_utf8(&self.network_interface[..len]).unwrap_or("?")
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HostNameError {
-    TooLong,
+pub enum HealthSnapshotError {
+    HostNameTooLong,
+    NetworkInterfaceTooLong,
 }
 
-impl fmt::Display for HostNameError {
+impl fmt::Display for HealthSnapshotError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "host name exceeds {MAX_HOST_NAME_LEN} bytes")
+        match self {
+            Self::HostNameTooLong => write!(f, "host name exceeds {MAX_HOST_NAME_LEN} bytes"),
+            Self::NetworkInterfaceTooLong => write!(
+                f,
+                "network interface name exceeds {MAX_NETWORK_INTERFACE_LEN} bytes"
+            ),
+        }
     }
 }
 
@@ -470,7 +508,10 @@ mod tests {
                     72,
                     true,
                     true,
-                    1_000,
+                    2_500,
+                    "enp3s0",
+                    InternetStatus::Reachable,
+                    Some(0),
                     [10, 0, 0, 12],
                     GuestSnapshot::from_slice(&[guest]),
                 )
@@ -584,6 +625,31 @@ mod tests {
     }
 
     #[test]
+    fn network_interface_names_are_bounded() {
+        assert_eq!(
+            HealthSnapshot::new(
+                "pve-01",
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                false,
+                true,
+                2_500,
+                "interface-name-too-long",
+                InternetStatus::Checking,
+                None,
+                [0; 4],
+                GuestSnapshot::EMPTY,
+            ),
+            Err(HealthSnapshotError::NetworkInterfaceTooLong)
+        );
+    }
+
+    #[test]
     fn largest_guest_snapshot_fits_the_frame_buffer() {
         let guest = GuestSummary::new(
             u32::MAX,
@@ -632,6 +698,9 @@ mod tests {
             true,
             true,
             u16::MAX,
+            "123456789012345",
+            InternetStatus::Failed,
+            Some(u32::MAX),
             [255; 4],
             GuestSnapshot::from_slice(&[guest; MAX_GUESTS]),
         )

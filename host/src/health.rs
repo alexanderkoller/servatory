@@ -1,8 +1,16 @@
-use std::{fs, net::Ipv4Addr, process::Command};
+use std::{
+    fs,
+    net::Ipv4Addr,
+    path::Path,
+    process::{Command, Stdio},
+    sync::{Arc, Mutex},
+    thread,
+    time::{Duration, Instant},
+};
 
 use s3_display_protocol::{
-    GuestKind, GuestSnapshot, GuestStatus, GuestSummary, HealthSnapshot, MAX_GUEST_NAME_LEN,
-    MAX_HOST_NAME_LEN,
+    GuestKind, GuestSnapshot, GuestStatus, GuestSummary, HealthSnapshot, InternetStatus,
+    MAX_GUEST_NAME_LEN, MAX_HOST_NAME_LEN,
 };
 use serde_json::Value;
 
@@ -12,9 +20,18 @@ struct CpuTimes {
     idle: u64,
 }
 
-#[derive(Default)]
 pub struct HealthCollector {
     previous_cpu: Option<CpuTimes>,
+    connectivity: ConnectivityProbe,
+}
+
+impl Default for HealthCollector {
+    fn default() -> Self {
+        Self {
+            previous_cpu: None,
+            connectivity: ConnectivityProbe::new(),
+        }
+    }
 }
 
 impl HealthCollector {
@@ -26,7 +43,9 @@ impl HealthCollector {
 
         let host_name = read_host_name();
         let (memory_used_mib, memory_total_mib) = read_memory();
-        let (network_up, network_mbps) = read_network_link();
+        let network = read_network();
+        let (internet_status, last_internet_success_age_seconds) =
+            self.connectivity.snapshot(network.up);
         HealthSnapshot::new(
             &host_name,
             read_uptime(),
@@ -37,9 +56,12 @@ impl HealthCollector {
             read_load_average(),
             read_root_usage(),
             read_backup_connected(),
-            network_up,
-            network_mbps,
-            read_ipv4(),
+            network.up,
+            network.mbps,
+            &network.interface,
+            internet_status,
+            last_internet_success_age_seconds,
+            network.ipv4,
             read_guests(&host_name),
         )
         .expect("collector truncates host names to the protocol limit")
@@ -156,38 +178,326 @@ fn read_backup_connected() -> bool {
     })
 }
 
-fn read_network_link() -> (bool, u16) {
-    let Ok(entries) = fs::read_dir("/sys/class/net") else {
-        return (false, 0);
-    };
-    let mut up = false;
-    let mut fastest = 0_u16;
-    for entry in entries.flatten() {
-        if entry.file_name() == "lo" {
-            continue;
-        }
-        let path = entry.path();
-        if fs::read_to_string(path.join("operstate")).is_ok_and(|state| state.trim() == "up") {
-            up = true;
-            let speed = fs::read_to_string(path.join("speed"))
-                .ok()
-                .and_then(|value| value.trim().parse::<u32>().ok())
-                .and_then(|value| u16::try_from(value).ok())
-                .unwrap_or(0);
-            fastest = fastest.max(speed);
-        }
-    }
-    (up, fastest)
+const CONNECTIVITY_PROBE_INTERVAL: Duration = Duration::from_secs(30);
+const CONNECTIVITY_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+const LINK_UP_SETTLE_DELAY: Duration = Duration::from_secs(3);
+const LINK_UP_RETRY_DELAY: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct NetworkSnapshot {
+    interface: String,
+    up: bool,
+    mbps: u16,
+    ipv4: [u8; 4],
 }
 
-fn read_ipv4() -> [u8; 4] {
-    let Ok(output) = Command::new("/usr/bin/hostname").arg("-I").output() else {
-        return [0; 4];
+struct ProbeState {
+    status: InternetStatus,
+    consecutive_failures: u8,
+    last_success: Option<Instant>,
+    next_probe: Instant,
+    in_flight: bool,
+    last_link_up: Option<bool>,
+    generation: u32,
+    link_up_grace_retry: bool,
+}
+
+impl ProbeState {
+    fn new(now: Instant) -> Self {
+        Self {
+            status: InternetStatus::Checking,
+            consecutive_failures: 0,
+            last_success: None,
+            next_probe: now,
+            in_flight: false,
+            last_link_up: None,
+            generation: 0,
+            link_up_grace_retry: false,
+        }
+    }
+
+    fn prepare_probe(&mut self, now: Instant, link_up: bool) -> Option<u32> {
+        if self.last_link_up != Some(link_up) {
+            self.last_link_up = Some(link_up);
+            self.next_probe = if link_up {
+                now + LINK_UP_SETTLE_DELAY
+            } else {
+                now
+            };
+            self.status = InternetStatus::Checking;
+            self.consecutive_failures = 0;
+            self.generation = self.generation.wrapping_add(1);
+            self.link_up_grace_retry = link_up;
+        }
+        if self.in_flight || now < self.next_probe {
+            return None;
+        }
+        self.in_flight = true;
+        self.next_probe = now + CONNECTIVITY_PROBE_INTERVAL;
+        Some(self.generation)
+    }
+
+    fn record_result(&mut self, generation: u32, reachable: bool, now: Instant) {
+        self.in_flight = false;
+        if self.generation != generation {
+            return;
+        }
+        if reachable {
+            self.status = InternetStatus::Reachable;
+            self.consecutive_failures = 0;
+            self.last_success = Some(now);
+            self.link_up_grace_retry = false;
+        } else if self.link_up_grace_retry {
+            self.status = InternetStatus::Checking;
+            self.link_up_grace_retry = false;
+            self.next_probe = now + LINK_UP_RETRY_DELAY;
+        } else {
+            self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+            self.status = if self.consecutive_failures == 1 {
+                InternetStatus::Missed
+            } else {
+                InternetStatus::Failed
+            };
+        }
+    }
+}
+
+struct ConnectivityProbe {
+    state: Arc<Mutex<ProbeState>>,
+}
+
+impl ConnectivityProbe {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ProbeState::new(Instant::now()))),
+        }
+    }
+
+    fn snapshot(&self, link_up: bool) -> (InternetStatus, Option<u32>) {
+        let now = Instant::now();
+        let probe_generation = self
+            .state
+            .lock()
+            .map_or(None, |mut state| state.prepare_probe(now, link_up));
+        if let Some(probe_generation) = probe_generation {
+            let shared = Arc::clone(&self.state);
+            if thread::Builder::new()
+                .name("internet-probe".into())
+                .spawn(move || {
+                    let reachable = ping_google();
+                    if let Ok(mut state) = shared.lock() {
+                        state.record_result(probe_generation, reachable, Instant::now());
+                    }
+                })
+                .is_err()
+                && let Ok(mut state) = self.state.lock()
+            {
+                state.record_result(probe_generation, false, Instant::now());
+            }
+        }
+
+        self.state
+            .lock()
+            .map_or((InternetStatus::Checking, None), |state| {
+                let age = state
+                    .last_success
+                    .map(|success| u32::try_from(success.elapsed().as_secs()).unwrap_or(u32::MAX));
+                (state.status, age)
+            })
+    }
+}
+
+fn ping_google() -> bool {
+    let Ok(mut child) = Command::new("/usr/bin/ping")
+        .args(["-4", "-n", "-c", "1", "-W", "2", "www.google.de"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
     };
-    String::from_utf8_lossy(&output.stdout)
-        .split_whitespace()
-        .find_map(|value| value.parse::<Ipv4Addr>().ok())
-        .map_or([0; 4], |address| address.octets())
+    let deadline = Instant::now() + CONNECTIVITY_PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+fn read_network() -> NetworkSnapshot {
+    let Some((routed_interface, ipv4)) = read_route() else {
+        return NetworkSnapshot::default();
+    };
+    let sysfs = Path::new("/sys/class/net");
+    let physical_interface = resolve_physical_interface(sysfs, &routed_interface)
+        .unwrap_or_else(|| routed_interface.clone());
+    let (up, mbps) = read_link(sysfs, &physical_interface);
+    NetworkSnapshot {
+        interface: physical_interface,
+        up,
+        mbps,
+        ipv4,
+    }
+}
+
+fn read_route() -> Option<(String, [u8; 4])> {
+    for executable in ["/usr/sbin/ip", "/usr/bin/ip"] {
+        let Ok(output) = Command::new(executable)
+            .args(["-4", "route", "get", "8.8.8.8"])
+            .output()
+        else {
+            continue;
+        };
+        if output.status.success()
+            && let Some(route) = parse_ip_route(&String::from_utf8_lossy(&output.stdout))
+        {
+            return Some(route);
+        }
+    }
+
+    let interface = parse_default_route(&fs::read_to_string("/proc/net/route").ok()?)?;
+    let ipv4 = read_interface_ipv4(&interface);
+    Some((interface, ipv4))
+}
+
+fn parse_ip_route(output: &str) -> Option<(String, [u8; 4])> {
+    let words: Vec<_> = output.split_whitespace().collect();
+    let interface = words
+        .windows(2)
+        .find(|pair| pair[0] == "dev")?
+        .get(1)?
+        .to_string();
+    let ipv4 = words
+        .windows(2)
+        .find(|pair| pair[0] == "src")
+        .and_then(|pair| pair.get(1))
+        .and_then(|address| address.parse::<Ipv4Addr>().ok())
+        .map_or([0; 4], |address| address.octets());
+    Some((interface, ipv4))
+}
+
+fn parse_default_route(routes: &str) -> Option<String> {
+    routes
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            if fields.len() < 8 || fields[1] != "00000000" || fields[7] != "00000000" {
+                return None;
+            }
+            let flags = u16::from_str_radix(fields[3], 16).ok()?;
+            if flags & 1 == 0 {
+                return None;
+            }
+            let metric = fields[6].parse::<u32>().ok()?;
+            Some((metric, fields[0].to_owned()))
+        })
+        .min_by_key(|(metric, _)| *metric)
+        .map(|(_, interface)| interface)
+}
+
+fn read_interface_ipv4(interface: &str) -> [u8; 4] {
+    for executable in ["/usr/sbin/ip", "/usr/bin/ip"] {
+        let Ok(output) = Command::new(executable)
+            .args([
+                "-4", "-o", "address", "show", "dev", interface, "scope", "global",
+            ])
+            .output()
+        else {
+            continue;
+        };
+        if output.status.success()
+            && let Some(address) = String::from_utf8_lossy(&output.stdout)
+                .split_whitespace()
+                .find_map(|word| word.split('/').next()?.parse::<Ipv4Addr>().ok())
+        {
+            return address.octets();
+        }
+    }
+    [0; 4]
+}
+
+fn resolve_physical_interface(sysfs: &Path, routed: &str) -> Option<String> {
+    resolve_interface(sysfs, routed, &mut Vec::new())
+}
+
+fn resolve_interface(sysfs: &Path, interface: &str, visited: &mut Vec<String>) -> Option<String> {
+    if visited.iter().any(|seen| seen == interface) {
+        return None;
+    }
+    visited.push(interface.to_owned());
+    let path = sysfs.join(interface);
+    if !path.exists() {
+        return None;
+    }
+
+    if let Ok(active_slave) = fs::read_to_string(path.join("bonding/active_slave")) {
+        let active_slave = active_slave.trim();
+        if !active_slave.is_empty()
+            && let Some(resolved) = resolve_interface(sysfs, active_slave, visited)
+        {
+            return Some(resolved);
+        }
+    }
+
+    if let Ok(entries) = fs::read_dir(path.join("brif")) {
+        let mut candidates: Vec<_> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let mut branch_visited = visited.clone();
+                resolve_interface(
+                    sysfs,
+                    &entry.file_name().to_string_lossy(),
+                    &mut branch_visited,
+                )
+            })
+            .collect();
+        candidates.sort();
+        return candidates.into_iter().max_by_key(|candidate| {
+            let candidate_path = sysfs.join(candidate);
+            let (up, speed) = read_link(sysfs, candidate);
+            (candidate_path.join("device").exists(), up, speed)
+        });
+    }
+
+    if let Ok(entries) = fs::read_dir(&path)
+        && let Some(lower) = entries
+            .flatten()
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("lower_"))
+            .and_then(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .strip_prefix("lower_")
+                    .map(str::to_owned)
+            })
+        && let Some(resolved) = resolve_interface(sysfs, &lower, visited)
+    {
+        return Some(resolved);
+    }
+
+    Some(interface.to_owned())
+}
+
+fn read_link(sysfs: &Path, interface: &str) -> (bool, u16) {
+    let path = sysfs.join(interface);
+    let up = fs::read_to_string(path.join("carrier")).map_or_else(
+        |_| fs::read_to_string(path.join("operstate")).is_ok_and(|state| state.trim() == "up"),
+        |carrier| carrier.trim() == "1",
+    );
+    let speed = fs::read_to_string(path.join("speed"))
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .and_then(|value| u16::try_from(value).ok())
+        .unwrap_or(0);
+    (up, speed)
 }
 
 fn read_guests(host_name: &str) -> GuestSnapshot {
@@ -300,6 +610,114 @@ fn truncate_utf8(value: &str, limit: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TempSysfs(std::path::PathBuf);
+
+    impl TempSysfs {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "s3-display-sysfs-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempSysfs {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn parses_routed_interface_and_source_address() {
+        assert_eq!(
+            parse_ip_route("8.8.8.8 via 192.168.1.1 dev vmbr0 src 192.168.1.50 uid 0\n"),
+            Some(("vmbr0".to_owned(), [192, 168, 1, 50]))
+        );
+    }
+
+    #[test]
+    fn fallback_route_uses_lowest_metric_default() {
+        let routes = "Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n\
+                      eno1 00000000 0101A8C0 0003 0 0 200 00000000 0 0 0\n\
+                      vmbr0 00000000 0101A8C0 0003 0 0 100 00000000 0 0 0\n";
+        assert_eq!(parse_default_route(routes).as_deref(), Some("vmbr0"));
+    }
+
+    #[test]
+    fn bridge_resolution_prefers_physical_port_over_faster_tap() {
+        let sysfs = TempSysfs::new();
+        for interface in ["vmbr0", "enp3s0", "tap100i0"] {
+            fs::create_dir_all(sysfs.0.join(interface)).unwrap();
+        }
+        fs::create_dir_all(sysfs.0.join("vmbr0/brif/enp3s0")).unwrap();
+        fs::create_dir_all(sysfs.0.join("vmbr0/brif/tap100i0")).unwrap();
+        fs::create_dir_all(sysfs.0.join("enp3s0/device")).unwrap();
+        fs::write(sysfs.0.join("enp3s0/carrier"), "1\n").unwrap();
+        fs::write(sysfs.0.join("enp3s0/speed"), "2500\n").unwrap();
+        fs::write(sysfs.0.join("tap100i0/carrier"), "1\n").unwrap();
+        fs::write(sysfs.0.join("tap100i0/speed"), "10000\n").unwrap();
+
+        assert_eq!(
+            resolve_physical_interface(&sysfs.0, "vmbr0").as_deref(),
+            Some("enp3s0")
+        );
+        assert_eq!(read_link(&sysfs.0, "enp3s0"), (true, 2_500));
+    }
+
+    #[test]
+    fn link_up_waits_then_retries_before_counting_a_failure() {
+        let now = Instant::now();
+        let mut state = ProbeState::new(now);
+        assert!(state.prepare_probe(now, true).is_none());
+        assert!(
+            state
+                .prepare_probe(now + Duration::from_secs(2), true)
+                .is_none()
+        );
+        let initial_generation = state
+            .prepare_probe(now + LINK_UP_SETTLE_DELAY, true)
+            .unwrap();
+        state.record_result(initial_generation, false, now + LINK_UP_SETTLE_DELAY);
+        assert_eq!(state.status, InternetStatus::Checking);
+        assert_eq!(state.consecutive_failures, 0);
+
+        assert!(
+            state
+                .prepare_probe(now + Duration::from_secs(7), true)
+                .is_none()
+        );
+        let retry_at = now + LINK_UP_SETTLE_DELAY + LINK_UP_RETRY_DELAY;
+        let retry_generation = state.prepare_probe(retry_at, true).unwrap();
+        state.record_result(retry_generation, false, retry_at);
+        assert_eq!(state.status, InternetStatus::Missed);
+        assert_eq!(state.consecutive_failures, 1);
+    }
+
+    #[test]
+    fn link_down_schedules_an_immediate_fresh_probe() {
+        let now = Instant::now();
+        let mut state = ProbeState::new(now);
+        assert!(state.prepare_probe(now, true).is_none());
+        let initial_generation = state
+            .prepare_probe(now + LINK_UP_SETTLE_DELAY, true)
+            .unwrap();
+        let succeeded_at = now + LINK_UP_SETTLE_DELAY;
+        state.record_result(initial_generation, true, succeeded_at);
+
+        let changed_generation = state
+            .prepare_probe(succeeded_at + Duration::from_secs(1), false)
+            .unwrap();
+        assert_ne!(changed_generation, initial_generation);
+        assert_eq!(state.status, InternetStatus::Checking);
+        assert_eq!(state.last_success, Some(succeeded_at));
+    }
 
     #[test]
     fn parses_proxmox_guest_json() {
