@@ -1,7 +1,5 @@
 [Unit]
 Description=M5Stick S3 Proxmox health display
-After=dev-m5stick\x2ds3.device
-BindsTo=dev-m5stick\x2ds3.device
 
 [Service]
 Type=simple
@@ -15,4 +13,3 @@ PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
-

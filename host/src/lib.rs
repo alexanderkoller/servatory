@@ -59,6 +59,7 @@ impl<S: Shutdown> EventHandler<S> {
         match message {
             DeviceMessage::Ready => {
                 eprintln!("display connected");
+                self.session_established = false;
                 Ok(false)
             }
             DeviceMessage::Ack { sequence } => {

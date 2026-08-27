@@ -135,9 +135,10 @@ brew install zig
 cargo install cargo-zigbuild
 ```
 
-The M5Stick must remain plugged into the Proxmox server, not the Mac. If it is
-already connected, the installer starts the daemon immediately; otherwise udev
-starts it when the display is plugged in.
+The M5Stick connects to the Proxmox server, not the Mac. The installer starts the
+daemon immediately whether or not the display is present. The daemon waits for
+the USB serial device, connects when it appears, and returns to waiting after a
+disconnect without exiting.
 
 To check it later:
 

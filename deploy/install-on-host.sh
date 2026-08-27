@@ -54,12 +54,12 @@ echo "Installing systemd service and udev rule..."
 "${privilege[@]}" udevadm control --reload-rules
 "${privilege[@]}" systemctl daemon-reload
 "${privilege[@]}" systemctl enable s3-display.service
+"${privilege[@]}" systemctl restart s3-display.service
 "${privilege[@]}" udevadm trigger
 "${privilege[@]}" udevadm settle
 
 if [[ -e /dev/m5stick-s3 ]]; then
-    "${privilege[@]}" systemctl restart s3-display.service
-    echo "Installed and started s3-display.service."
+    echo "Installed and started s3-display.service; the display is connected."
 else
-    echo "Installed s3-display.service. Plug the display into the Proxmox host to start it."
+    echo "Installed and started s3-display.service; it is waiting for the display."
 fi
