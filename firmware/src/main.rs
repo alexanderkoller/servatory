@@ -34,8 +34,8 @@ use mipidsi::{
 };
 use s3_display_protocol::{
     BackupJobStatus, ButtonAction, DeviceMessage, FilesystemUsage, FrameDecoder, GuestKind,
-    GuestStatus, HealthSnapshot, HostMessage, InternetStatus, MAX_FRAME_LEN, decode_host,
-    encode_device,
+    GuestStatus, HealthSnapshot, HostMessage, InternetStatus, MAX_FRAME_LEN, ShutdownFailure,
+    ShutdownPhase, decode_host, encode_device,
 };
 use static_cell::StaticCell;
 
@@ -62,6 +62,9 @@ const SHUTDOWN_ANIMATION_DELAY: Duration = Duration::from_millis(200);
 const LONG_PRESS: Duration = Duration::from_millis(3_000);
 const LINK_TIMEOUT: Duration = Duration::from_secs(15);
 const USB_ACTIVITY_TIMEOUT: Duration = Duration::from_millis(250);
+const SHUTDOWN_SPINNER_INTERVAL: Duration = Duration::from_millis(250);
+const SHUTDOWN_REPORT_TIMEOUT: Duration = Duration::from_secs(3);
+const SHUTDOWN_USB_LOST_CONFIRM: Duration = Duration::from_secs(2);
 const MAX_DEVICE_FRAME_LEN: usize = 64;
 const PAGE_COUNT: u8 = 5;
 const GUESTS_PER_PAGE: usize = 4;
@@ -74,6 +77,30 @@ enum DaemonState {
     Connected,
     Stale,
     PoweringOff,
+}
+
+#[derive(Clone, Copy)]
+enum ShutdownDisplay {
+    Accepted,
+    Guests {
+        total: u16,
+        remaining: u16,
+    },
+    GuestsStopped,
+    HostPoweroff {
+        spinner: u8,
+        remaining: u16,
+    },
+    ReportingLost {
+        remaining: u16,
+    },
+    ConnectionLost {
+        remaining: u16,
+    },
+    Failed {
+        reason: ShutdownFailure,
+        remaining: u16,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -263,6 +290,9 @@ fn main() -> ! {
     let mut page = 0_u8;
     let mut shutdown_animation_active = false;
     let mut shutdown_animation_height = 0_u16;
+    let mut shutdown_display = ShutdownDisplay::Accepted;
+    let mut last_shutdown_spinner = Instant::now();
+    let mut shutdown_usb_lost_since = None;
 
     // Render before attempting any USB traffic so offline operation always works.
     render(
@@ -272,6 +302,7 @@ fn main() -> ! {
         daemon,
         page,
         health_snapshot,
+        shutdown_display,
     );
     usb_tx.enqueue(DeviceMessage::Ready);
 
@@ -294,6 +325,7 @@ fn main() -> ! {
                 daemon,
                 page,
                 health_snapshot,
+                shutdown_display,
             );
         }
 
@@ -316,6 +348,7 @@ fn main() -> ! {
                             daemon,
                             page,
                             health_snapshot,
+                            shutdown_display,
                         );
                     }
                 }
@@ -331,6 +364,7 @@ fn main() -> ! {
                             daemon,
                             page,
                             health_snapshot,
+                            shutdown_display,
                         );
                     }
                 }
@@ -349,11 +383,15 @@ fn main() -> ! {
                             daemon,
                             page,
                             health_snapshot,
+                            shutdown_display,
                         );
                     }
                 }
                 Ok(HostMessage::ShutdownAccepted) => {
+                    last_update = Some(now);
+                    shutdown_usb_lost_since = None;
                     daemon = DaemonState::PoweringOff;
+                    shutdown_display = ShutdownDisplay::Accepted;
                     render(
                         &mut display,
                         framebuffer,
@@ -361,6 +399,59 @@ fn main() -> ! {
                         daemon,
                         page,
                         health_snapshot,
+                        shutdown_display,
+                    );
+                }
+                Ok(HostMessage::ShutdownProgress {
+                    phase,
+                    guests_total,
+                    guests_remaining,
+                }) => {
+                    last_update = Some(now);
+                    shutdown_usb_lost_since = None;
+                    daemon = DaemonState::PoweringOff;
+                    shutdown_display = match phase {
+                        ShutdownPhase::PreparingGuests => ShutdownDisplay::Accepted,
+                        ShutdownPhase::StoppingGuests => ShutdownDisplay::Guests {
+                            total: guests_total,
+                            remaining: guests_remaining,
+                        },
+                        ShutdownPhase::GuestsStopped => ShutdownDisplay::GuestsStopped,
+                        ShutdownPhase::PoweringOff => {
+                            last_shutdown_spinner = now;
+                            ShutdownDisplay::HostPoweroff {
+                                spinner: 0,
+                                remaining: guests_remaining,
+                            }
+                        }
+                    };
+                    render(
+                        &mut display,
+                        framebuffer,
+                        usb_connected,
+                        daemon,
+                        page,
+                        health_snapshot,
+                        shutdown_display,
+                    );
+                }
+                Ok(HostMessage::ShutdownFailed {
+                    reason,
+                    guests_remaining,
+                }) => {
+                    daemon = DaemonState::PoweringOff;
+                    shutdown_display = ShutdownDisplay::Failed {
+                        reason,
+                        remaining: guests_remaining,
+                    };
+                    render(
+                        &mut display,
+                        framebuffer,
+                        usb_connected,
+                        daemon,
+                        page,
+                        health_snapshot,
+                        shutdown_display,
                     );
                 }
                 Err(_) => {}
@@ -379,6 +470,7 @@ fn main() -> ! {
                     daemon,
                     page,
                     health_snapshot,
+                    shutdown_display,
                 );
             }
         }
@@ -398,6 +490,7 @@ fn main() -> ! {
                     daemon,
                     page,
                     health_snapshot,
+                    shutdown_display,
                 );
             }
             // A recent decoded host update is the reliable session signal. The
@@ -419,6 +512,7 @@ fn main() -> ! {
                         daemon,
                         page,
                         health_snapshot,
+                        shutdown_display,
                     );
                 }
                 shutdown_animation_active = false;
@@ -450,6 +544,74 @@ fn main() -> ! {
                 daemon,
                 page,
                 health_snapshot,
+                shutdown_display,
+            );
+        }
+
+        if daemon == DaemonState::PoweringOff
+            && !matches!(shutdown_display, ShutdownDisplay::Failed { .. })
+            && !matches!(shutdown_display, ShutdownDisplay::ConnectionLost { .. })
+        {
+            if usb_connected {
+                shutdown_usb_lost_since = None;
+            } else {
+                let lost_since = shutdown_usb_lost_since.get_or_insert(now);
+                if now - *lost_since >= SHUTDOWN_USB_LOST_CONFIRM {
+                    shutdown_display = ShutdownDisplay::ConnectionLost {
+                        remaining: shutdown_remaining(shutdown_display),
+                    };
+                    render(
+                        &mut display,
+                        framebuffer,
+                        usb_connected,
+                        daemon,
+                        page,
+                        health_snapshot,
+                        shutdown_display,
+                    );
+                }
+            }
+        } else if daemon != DaemonState::PoweringOff {
+            shutdown_usb_lost_since = None;
+        }
+
+        if daemon == DaemonState::PoweringOff
+            && !matches!(shutdown_display, ShutdownDisplay::ReportingLost { .. })
+            && !matches!(shutdown_display, ShutdownDisplay::ConnectionLost { .. })
+            && !matches!(shutdown_display, ShutdownDisplay::Failed { .. })
+            && last_update.is_some_and(|updated| now - updated >= SHUTDOWN_REPORT_TIMEOUT)
+        {
+            shutdown_display = ShutdownDisplay::ReportingLost {
+                remaining: shutdown_remaining(shutdown_display),
+            };
+            render(
+                &mut display,
+                framebuffer,
+                usb_connected,
+                daemon,
+                page,
+                health_snapshot,
+                shutdown_display,
+            );
+        }
+
+        if daemon == DaemonState::PoweringOff
+            && now - last_shutdown_spinner >= SHUTDOWN_SPINNER_INTERVAL
+            && let ShutdownDisplay::HostPoweroff { spinner, remaining } = shutdown_display
+        {
+            shutdown_display = ShutdownDisplay::HostPoweroff {
+                spinner: (spinner + 1) % 4,
+                remaining,
+            };
+            last_shutdown_spinner = now;
+            render(
+                &mut display,
+                framebuffer,
+                usb_connected,
+                daemon,
+                page,
+                health_snapshot,
+                shutdown_display,
             );
         }
 
@@ -555,6 +717,7 @@ fn render<D>(
     daemon: DaemonState,
     page: u8,
     health_snapshot: Option<HealthSnapshot>,
+    shutdown_display: ShutdownDisplay,
 ) where
     D: DrawTarget<Color = Rgb565>,
 {
@@ -576,7 +739,7 @@ fn render<D>(
 
     match (daemon, health_snapshot) {
         (DaemonState::PoweringOff, _) => {
-            draw_message(framebuffer, "POWERING OFF", "Shutdown accepted", accent);
+            draw_shutdown_status(framebuffer, shutdown_display, accent);
         }
         (DaemonState::Stale, _) => {
             draw_message(framebuffer, "HOST LOST", "Updates stopped", accent);
@@ -1473,6 +1636,134 @@ where
     )
     .draw(display)
     .ok();
+}
+
+fn draw_shutdown_status<D>(display: &mut D, status: ShutdownDisplay, color: Rgb565)
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    match status {
+        ShutdownDisplay::Accepted => {
+            draw_message(display, "SHUTTING DOWN", "Preparing guests...", color);
+        }
+        ShutdownDisplay::Guests { total, remaining } => {
+            let mut detail = String::<32>::new();
+            let _ = write!(&mut detail, "{remaining} of {total} remaining");
+            draw_message(display, "STOPPING GUESTS", &detail, color);
+            draw_guest_shutdown_bar(display, total, remaining);
+        }
+        ShutdownDisplay::GuestsStopped => {
+            draw_message(
+                display,
+                "GUESTS STOPPED",
+                "Host shutdown next",
+                Rgb565::GREEN,
+            );
+        }
+        ShutdownDisplay::HostPoweroff { spinner, remaining } => {
+            let mut detail = String::<32>::new();
+            if remaining == 0 {
+                let _ = detail.push_str("Stopping services...");
+            } else {
+                let _ = write!(&mut detail, "{remaining} guests handed off");
+            }
+            draw_message(display, "HOST SHUTDOWN", &detail, color);
+            draw_shutdown_spinner(display, spinner);
+        }
+        ShutdownDisplay::ReportingLost { remaining } => {
+            let mut detail = String::<32>::new();
+            let _ = write!(&mut detail, "USB active, last count {remaining}");
+            draw_message(display, "REPORTING LOST", &detail, Rgb565::YELLOW);
+        }
+        ShutdownDisplay::ConnectionLost { remaining } => {
+            let mut detail = String::<32>::new();
+            let _ = write!(&mut detail, "USB link down, last {remaining}");
+            draw_message(display, "CONNECTION LOST", &detail, Rgb565::YELLOW);
+        }
+        ShutdownDisplay::Failed { reason, remaining } => {
+            let mut detail = String::<32>::new();
+            match reason {
+                ShutdownFailure::GuestQuery => {
+                    let _ = detail.push_str("Could not query guests");
+                }
+                ShutdownFailure::GuestShutdown => {
+                    let _ = write!(&mut detail, "{remaining} guests still running");
+                }
+                ShutdownFailure::HostPoweroff => {
+                    let _ = detail.push_str("Could not power off host");
+                }
+            }
+            draw_message(display, "SHUTDOWN FAILED", &detail, color);
+        }
+    }
+}
+
+fn shutdown_remaining(status: ShutdownDisplay) -> u16 {
+    match status {
+        ShutdownDisplay::Guests { remaining, .. }
+        | ShutdownDisplay::HostPoweroff { remaining, .. }
+        | ShutdownDisplay::ReportingLost { remaining }
+        | ShutdownDisplay::ConnectionLost { remaining }
+        | ShutdownDisplay::Failed { remaining, .. } => remaining,
+        ShutdownDisplay::Accepted | ShutdownDisplay::GuestsStopped => 0,
+    }
+}
+
+fn draw_guest_shutdown_bar<D>(display: &mut D, total: u16, remaining: u16)
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let border = Rectangle::new(Point::new(20, 94), Size::new(200, 12));
+    border
+        .into_styled(
+            PrimitiveStyleBuilder::new()
+                .stroke_color(Rgb565::WHITE)
+                .stroke_width(1)
+                .build(),
+        )
+        .draw(display)
+        .ok();
+
+    let stopped = total.saturating_sub(remaining.min(total));
+    let width = if total == 0 {
+        198
+    } else {
+        u32::from(stopped).saturating_mul(198) / u32::from(total)
+    };
+    if width > 0 {
+        Rectangle::new(Point::new(21, 95), Size::new(width, 10))
+            .into_styled(PrimitiveStyleBuilder::new().fill_color(Rgb565::RED).build())
+            .draw(display)
+            .ok();
+    }
+}
+
+fn draw_shutdown_spinner<D>(display: &mut D, frame: u8)
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    for (index, point) in [
+        Point::new(117, 91),
+        Point::new(129, 103),
+        Point::new(117, 115),
+        Point::new(105, 103),
+    ]
+    .iter()
+    .enumerate()
+    {
+        Rectangle::new(*point, Size::new(7, 7))
+            .into_styled(
+                PrimitiveStyleBuilder::new()
+                    .fill_color(if index == usize::from(frame) {
+                        Rgb565::RED
+                    } else {
+                        Rgb565::new(8, 14, 13)
+                    })
+                    .build(),
+            )
+            .draw(display)
+            .ok();
+    }
 }
 
 fn health_status(snapshot: &HealthSnapshot) -> (&'static str, Rgb565) {

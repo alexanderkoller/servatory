@@ -25,8 +25,13 @@ valid update from the rebooted host returns the display to its normal status.
 The front button changes between five health screens on a short press. The two
 guest screens expose all eight entries supported by the protocol. Holding it
 for three seconds during a live daemon session sends a shutdown request. The host
-acknowledges that request on the display before invoking
-`/usr/bin/systemctl poweroff`. Shutdown handling is disabled unless the daemon is
+acknowledges that request and immediately queues `/usr/bin/systemctl poweroff`.
+The daemon remains alive while Proxmox's native `pve-guests` service shuts down
+the guests, reporting the live number remaining. The display then animates the
+final host phase locally, since the daemon and USB connection disappear during
+poweroff. It distinguishes a lost daemon heartbeat while USB data remains active
+from a confirmed loss of the USB data link; neither state claims that the host
+has finished powering off. Shutdown handling is disabled unless the daemon is
 started with `--allow-shutdown`.
 
 ## Prerequisites
@@ -66,7 +71,7 @@ To build locally and reflash a Stick that remains attached to the Proxmox server
 use the deployment script with a regular SSH account:
 
 ```sh
-./deploy/flash-firmware.sh alex@192.168.1.50
+./deploy/flash-remote-firmware.sh alex@192.168.1.50
 ```
 
 The script builds the firmware on the Mac, downloads and verifies the official

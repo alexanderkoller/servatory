@@ -1,5 +1,8 @@
 [Unit]
 Description=M5Stick S3 Proxmox health display
+# Keep reporting while Proxmox's native guest shutdown service runs. Shutdown
+# ordering is the reverse of startup ordering, so pve-guests stops first.
+Before=pve-guests.service
 After=pve-cluster.service
 
 [Service]

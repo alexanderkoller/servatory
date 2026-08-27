@@ -88,6 +88,21 @@ pub enum BackupJobStatus {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum ShutdownPhase {
+    PreparingGuests,
+    StoppingGuests,
+    GuestsStopped,
+    PoweringOff,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum ShutdownFailure {
+    GuestQuery,
+    GuestShutdown,
+    HostPoweroff,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FilesystemUsage {
     pub used_percent: u8,
     pub available_mib: u32,
@@ -356,6 +371,15 @@ pub enum HostMessage {
         unix_seconds: UnixSeconds,
         snapshot: HealthSnapshot,
     },
+    ShutdownProgress {
+        phase: ShutdownPhase,
+        guests_total: u16,
+        guests_remaining: u16,
+    },
+    ShutdownFailed {
+        reason: ShutdownFailure,
+        guests_remaining: u16,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -566,6 +590,15 @@ mod tests {
                     GuestSnapshot::from_slice(&[guest]),
                 )
                 .unwrap(),
+            },
+            HostMessage::ShutdownProgress {
+                phase: ShutdownPhase::StoppingGuests,
+                guests_total: 5,
+                guests_remaining: 3,
+            },
+            HostMessage::ShutdownFailed {
+                reason: ShutdownFailure::GuestShutdown,
+                guests_remaining: 2,
             },
         ];
         for expected in host_messages {

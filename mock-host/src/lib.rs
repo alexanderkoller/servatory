@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::{io::Write, thread, time::Duration};
 
 use s3_display_host::Shutdown;
 use s3_display_protocol::{
@@ -8,11 +8,15 @@ use s3_display_protocol::{
 
 pub struct ConsoleShutdown<W> {
     output: W,
+    progress_delay: Duration,
 }
 
 impl<W> ConsoleShutdown<W> {
     pub const fn new(output: W) -> Self {
-        Self { output }
+        Self {
+            output,
+            progress_delay: Duration::from_millis(500),
+        }
     }
 
     pub fn into_inner(self) -> W {
@@ -21,11 +25,35 @@ impl<W> ConsoleShutdown<W> {
 }
 
 impl<W: Write> Shutdown for ConsoleShutdown<W> {
-    fn poweroff(&mut self) -> io::Result<()> {
+    fn poweroff(&mut self, output: &mut impl Write) -> anyhow::Result<()> {
+        use s3_display_host::write_host_message;
+        use s3_display_protocol::{HostMessage, ShutdownPhase};
+
+        for (phase, remaining) in [
+            (ShutdownPhase::PreparingGuests, 4),
+            (ShutdownPhase::StoppingGuests, 4),
+            (ShutdownPhase::StoppingGuests, 3),
+            (ShutdownPhase::StoppingGuests, 2),
+            (ShutdownPhase::StoppingGuests, 1),
+            (ShutdownPhase::GuestsStopped, 0),
+            (ShutdownPhase::PoweringOff, 0),
+        ] {
+            write_host_message(
+                HostMessage::ShutdownProgress {
+                    phase,
+                    guests_total: 4,
+                    guests_remaining: remaining,
+                },
+                output,
+            )?;
+            output.flush()?;
+            thread::sleep(self.progress_delay);
+        }
         writeln!(
             self.output,
             "mock shutdown requested; no system shutdown was performed"
-        )
+        )?;
+        Ok(())
     }
 }
 
@@ -173,7 +201,8 @@ mod tests {
     #[test]
     fn shutdown_only_writes_a_message() {
         let mut shutdown = ConsoleShutdown::new(Vec::new());
-        shutdown.poweroff().unwrap();
+        shutdown.progress_delay = Duration::ZERO;
+        shutdown.poweroff(&mut Vec::new()).unwrap();
         let output = String::from_utf8(shutdown.into_inner()).unwrap();
         assert!(output.contains("no system shutdown"));
     }
