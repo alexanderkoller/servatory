@@ -2,7 +2,7 @@
 
 This repository contains a tiny USB-connected Proxmox health display. Its
 240x135 landscape Split View shows an overview followed by resources,
-storage/network, and guest screens.
+storage/network, and two guest-list screens.
 
 - `firmware/`: allocation-free Rust firmware for the M5Stick S3 (ESP32-S3).
 - `host/`: Linux daemon that sends regular updates and handles button events.
@@ -22,7 +22,8 @@ session. All USB transmission is non-blocking, and shutdown requests are never
 queued across disconnected sessions. After an accepted shutdown, the first
 valid update from the rebooted host returns the display to its normal status.
 
-The front button changes between four health screens on a short press. Holding it
+The front button changes between five health screens on a short press. The two
+guest screens expose all eight entries supported by the protocol. Holding it
 for three seconds during a live daemon session sends a shutdown request. The host
 acknowledges that request on the display before invoking
 `/usr/bin/systemctl poweroff`. Shutdown handling is disabled unless the daemon is
@@ -174,7 +175,7 @@ backup connection. Guest state comes from `pvesh get /cluster/resources --type
 vm` and is bounded to eight entries on the display.
 
 The mock host sends deterministic values matching the Split View design, so all
-four pages can be exercised away from a Proxmox installation.
+five pages can be exercised away from a Proxmox installation.
 
 ## Wire protocol
 
