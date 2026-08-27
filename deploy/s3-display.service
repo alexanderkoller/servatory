@@ -1,5 +1,6 @@
 [Unit]
 Description=M5Stick S3 Proxmox health display
+After=pve-cluster.service
 
 [Service]
 Type=simple

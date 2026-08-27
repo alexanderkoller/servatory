@@ -5,12 +5,12 @@ use std::{
     process::{Command, Stdio},
     sync::{Arc, Mutex},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use s3_display_protocol::{
-    GuestKind, GuestSnapshot, GuestStatus, GuestSummary, HealthSnapshot, InternetStatus,
-    MAX_GUEST_NAME_LEN, MAX_HOST_NAME_LEN,
+    BackupJobStatus, FilesystemUsage, GuestKind, GuestSnapshot, GuestStatus, GuestSummary,
+    HealthSnapshot, InternetStatus, MAX_GUEST_NAME_LEN, MAX_HOST_NAME_LEN,
 };
 use serde_json::Value;
 
@@ -46,6 +46,16 @@ impl HealthCollector {
         let network = read_network();
         let (internet_status, last_internet_success_age_seconds) =
             self.connectivity.snapshot(network.up);
+        let root_storage = read_filesystem_usage("/");
+        let hdd_storage = read_filesystem_usage("/mnt/pve/hdd");
+        let backup_storage = read_filesystem_usage("/mnt/pve/backup");
+        let (backup_job_status, last_successful_backup_age_seconds) = read_backup_job_status(
+            &host_name,
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .map(|duration| duration.as_secs()),
+        );
         HealthSnapshot::new(
             &host_name,
             read_uptime(),
@@ -54,8 +64,11 @@ impl HealthCollector {
             memory_total_mib,
             read_io_pressure(),
             read_load_average(),
-            read_root_usage(),
-            read_backup_connected(),
+            root_storage,
+            hdd_storage,
+            backup_storage,
+            backup_job_status,
+            last_successful_backup_age_seconds,
             network.up,
             network.mbps,
             &network.interface,
@@ -156,26 +169,139 @@ fn read_load_average() -> u16 {
         .unwrap_or(0)
 }
 
-fn read_root_usage() -> u8 {
-    let Ok(output) = Command::new("/usr/bin/df").args(["-P", "/"]).output() else {
-        return 0;
+fn read_filesystem_usage(path: &str) -> FilesystemUsage {
+    let Ok(output) = Command::new("/usr/bin/df")
+        .args(["-P", "-k", path])
+        .output()
+    else {
+        return FilesystemUsage::MISSING;
     };
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.lines()
-        .nth(1)
-        .and_then(|line| line.split_whitespace().nth(4))
-        .and_then(|value| value.trim_end_matches('%').parse().ok())
-        .unwrap_or(0)
+    if !output.status.success() {
+        return FilesystemUsage::MISSING;
+    }
+    parse_filesystem_usage(&String::from_utf8_lossy(&output.stdout), path)
+        .unwrap_or(FilesystemUsage::MISSING)
 }
 
-fn read_backup_connected() -> bool {
-    fs::read_to_string("/proc/mounts").is_ok_and(|mounts| {
-        mounts.lines().any(|line| {
-            line.split_whitespace()
-                .nth(1)
-                .is_some_and(|path| path.starts_with("/mnt/pve/"))
+fn parse_filesystem_usage(output: &str, expected_mount: &str) -> Option<FilesystemUsage> {
+    let fields: Vec<_> = output.lines().last()?.split_whitespace().collect();
+    if fields.len() < 6 || fields.last().copied() != Some(expected_mount) {
+        return None;
+    }
+    let available_kib = fields.get(3)?.parse::<u64>().ok()?;
+    let used_percent = fields.get(4)?.trim_end_matches('%').parse::<u8>().ok()?;
+    Some(FilesystemUsage::new(
+        used_percent,
+        u32::try_from(available_kib / 1_024).unwrap_or(u32::MAX),
+    ))
+}
+
+const BACKUP_MAX_AGE_SECONDS: u64 = 24 * 60 * 60;
+
+fn read_backup_job_status(
+    host_name: &str,
+    now_seconds: Option<u64>,
+) -> (BackupJobStatus, Option<u32>) {
+    let Some(now_seconds) = now_seconds else {
+        return (BackupJobStatus::Unknown, None);
+    };
+    let Ok(jobs) = Command::new("/usr/bin/pvesh")
+        .args(["get", "/cluster/backup", "--output-format", "json"])
+        .output()
+    else {
+        return (BackupJobStatus::Unknown, None);
+    };
+    let task_path = format!("/nodes/{host_name}/tasks");
+    let Ok(tasks) = Command::new("/usr/bin/pvesh")
+        .args([
+            "get",
+            &task_path,
+            "--typefilter",
+            "vzdump",
+            "--source",
+            "all",
+            "--limit",
+            "50",
+            "--output-format",
+            "json",
+        ])
+        .output()
+    else {
+        return (BackupJobStatus::Unknown, None);
+    };
+    if !jobs.status.success() || !tasks.status.success() {
+        return (BackupJobStatus::Unknown, None);
+    }
+    parse_backup_job_status(&jobs.stdout, &tasks.stdout, host_name, now_seconds)
+}
+
+fn parse_backup_job_status(
+    jobs_bytes: &[u8],
+    tasks_bytes: &[u8],
+    host_name: &str,
+    now_seconds: u64,
+) -> (BackupJobStatus, Option<u32>) {
+    let Ok(Value::Array(jobs)) = serde_json::from_slice(jobs_bytes) else {
+        return (BackupJobStatus::Unknown, None);
+    };
+    let enabled_jobs = jobs
+        .iter()
+        .filter(|job| backup_job_enabled(job))
+        .filter(|job| {
+            job.get("node")
+                .and_then(Value::as_str)
+                .is_none_or(|node| node.is_empty() || node == "all" || node == host_name)
         })
-    })
+        .count();
+    if enabled_jobs == 0 {
+        return (BackupJobStatus::NoJob, None);
+    }
+
+    let Ok(Value::Array(tasks)) = serde_json::from_slice(tasks_bytes) else {
+        return (BackupJobStatus::Unknown, None);
+    };
+    let mut local_tasks: Vec<_> = tasks
+        .iter()
+        .filter(|task| {
+            task.get("node")
+                .and_then(Value::as_str)
+                .is_none_or(|node| node == host_name)
+        })
+        .collect();
+    local_tasks.sort_by_key(|task| task.get("starttime").and_then(Value::as_u64).unwrap_or(0));
+
+    let last_success_end = local_tasks
+        .iter()
+        .filter(|task| task.get("status").and_then(Value::as_str) == Some("OK"))
+        .filter_map(|task| task.get("endtime").and_then(Value::as_u64))
+        .max();
+    let success_age = last_success_end
+        .map(|end| u32::try_from(now_seconds.saturating_sub(end)).unwrap_or(u32::MAX));
+
+    let Some(latest) = local_tasks.last() else {
+        return (BackupJobStatus::Stale, None);
+    };
+    if latest.get("endtime").and_then(Value::as_u64).is_none() {
+        return (BackupJobStatus::Running, success_age);
+    }
+    if latest.get("status").and_then(Value::as_str) != Some("OK") {
+        return (BackupJobStatus::Failed, success_age);
+    }
+    if success_age.is_some_and(|age| u64::from(age) <= BACKUP_MAX_AGE_SECONDS) {
+        (BackupJobStatus::Healthy, success_age)
+    } else {
+        (BackupJobStatus::Stale, success_age)
+    }
+}
+
+fn backup_job_enabled(job: &Value) -> bool {
+    match job.get("enabled") {
+        None => true,
+        Some(Value::Bool(enabled)) => *enabled,
+        Some(Value::Number(enabled)) => enabled.as_u64() != Some(0),
+        Some(Value::String(enabled)) => enabled != "0",
+        Some(_) => false,
+    }
 }
 
 const CONNECTIVITY_PROBE_INTERVAL: Duration = Duration::from_secs(30);
@@ -632,6 +758,72 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn parses_df_usage_and_available_space() {
+        let usage = parse_filesystem_usage(
+            "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sdc1 9767546464 5476083304 3758096384 60% /mnt/pve/backup\n",
+            "/mnt/pve/backup",
+        )
+        .unwrap();
+        assert!(usage.mounted);
+        assert_eq!(usage.used_percent, 60);
+        assert_eq!(usage.available_mib, 3_670_016);
+        assert!(parse_filesystem_usage(
+            "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/mapper/pve-root 98559220 5000000 87000000 6% /\n",
+            "/mnt/pve/backup",
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn backup_status_uses_latest_successful_vzdump_age() {
+        let now = 1_800_000_000;
+        let (status, age) = parse_backup_job_status(
+            br#"[{"id":"nightly","enabled":1,"node":"pve-01"}]"#,
+            br#"[{"node":"pve-01","starttime":1799978000,"endtime":1799978400,"status":"OK"}]"#,
+            "pve-01",
+            now,
+        );
+        assert_eq!(status, BackupJobStatus::Healthy);
+        assert_eq!(age, Some(21_600));
+    }
+
+    #[test]
+    fn newer_failed_backup_overrides_a_recent_success() {
+        let (status, age) = parse_backup_job_status(
+            br#"[{"id":"nightly","enabled":true}]"#,
+            br#"[{"starttime":100,"endtime":110,"status":"OK"},{"starttime":120,"endtime":130,"status":"ERROR: disk full"}]"#,
+            "pve-01",
+            200,
+        );
+        assert_eq!(status, BackupJobStatus::Failed);
+        assert_eq!(age, Some(90));
+    }
+
+    #[test]
+    fn backup_older_than_twenty_four_hours_is_stale() {
+        let (status, age) = parse_backup_job_status(
+            br#"[{"id":"nightly"}]"#,
+            br#"[{"starttime":1,"endtime":100,"status":"OK"}]"#,
+            "pve-01",
+            86_501,
+        );
+        assert_eq!(status, BackupJobStatus::Stale);
+        assert_eq!(age, Some(86_401));
+    }
+
+    #[test]
+    fn disabled_or_remote_jobs_do_not_count() {
+        let (status, age) = parse_backup_job_status(
+            br#"[{"id":"disabled","enabled":0},{"id":"remote","node":"pve-02"}]"#,
+            br"[]",
+            "pve-01",
+            100,
+        );
+        assert_eq!(status, BackupJobStatus::NoJob);
+        assert_eq!(age, None);
     }
 
     #[test]

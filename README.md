@@ -168,8 +168,9 @@ has multiple matching boards, extend the rule with the StickS3's serial number.
 ## Health data
 
 Every update contains a fixed-size health snapshot. The production daemon reads
-CPU, memory, load, uptime, and I/O pressure from `/proc` and root usage from
-`df`. For networking, it identifies the interface and source address used by the
+CPU, memory, load, uptime, and I/O pressure from `/proc`, plus usage and available
+space for `/`, `/mnt/pve/hdd`, and `/mnt/pve/backup` from `df`. For networking,
+it identifies the interface and source address used by the
 IPv4 route to the internet, resolves Proxmox bridges, bonds, and VLANs down to
 the active physical port, and reads that port's carrier and negotiated speed
 from `/sys/class/net`. This avoids mistaking a fast virtual guest interface for
@@ -181,9 +182,11 @@ the network path to settle; if that first probe misses, it retries after five
 seconds while the display continues to show `CHECKING`. One subsequent missed
 probe is a warning and two consecutive misses are reported as `PING FAILED`;
 the detail screen then shows the elapsed time since the last successful probe.
-A mounted Proxmox storage path below
-`/mnt/pve/` is shown as the backup connection. Guest state comes from `pvesh get
-/cluster/resources --type vm` and is bounded to eight entries on the display.
+Backup health comes from enabled jobs returned by `pvesh get /cluster/backup`
+and recent `vzdump` task history. A failed latest task, a missing job, or a last
+successful backup older than 24 hours produces a warning. Guest state comes from
+`pvesh get /cluster/resources --type vm` and is bounded to eight entries on the
+display.
 
 The mock host sends deterministic values matching the Split View design, so all
 five pages can be exercised away from a Proxmox installation.

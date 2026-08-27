@@ -2,7 +2,8 @@ use std::io::{self, Write};
 
 use s3_display_host::Shutdown;
 use s3_display_protocol::{
-    GuestKind, GuestSnapshot, GuestStatus, GuestSummary, HealthSnapshot, InternetStatus,
+    BackupJobStatus, FilesystemUsage, GuestKind, GuestSnapshot, GuestStatus, GuestSummary,
+    HealthSnapshot, InternetStatus,
 };
 
 pub struct ConsoleShutdown<W> {
@@ -96,8 +97,11 @@ pub fn made_up_health() -> HealthSnapshot {
         32_768,
         4,
         82,
-        72,
-        true,
+        FilesystemUsage::new(6, 85 * 1_024),
+        FilesystemUsage::new(33, 6_186_598),
+        FilesystemUsage::new(60, 3_670_016),
+        BackupJobStatus::Healthy,
+        Some(6 * 60 * 60),
         true,
         2_500,
         "enp3s0",
@@ -161,7 +165,8 @@ mod tests {
         assert_eq!(health.network_mbps, 2_500);
         assert_eq!(health.network_interface(), "enp3s0");
         assert_eq!(health.internet_status, InternetStatus::Reachable);
-        assert!(health.backup_connected);
+        assert_eq!(health.backup_job_status, BackupJobStatus::Healthy);
+        assert_eq!(health.last_successful_backup_age_seconds, Some(21_600));
         assert_eq!(health.guests.guests().len(), 5);
     }
 

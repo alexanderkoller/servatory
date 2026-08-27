@@ -4,7 +4,7 @@ use core::fmt;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-pub const PROTOCOL_VERSION: u8 = 2;
+pub const PROTOCOL_VERSION: u8 = 3;
 /// Maximum COBS-encoded frame size, including its trailing zero delimiter.
 pub const MAX_FRAME_LEN: usize = 512;
 pub const MAX_GUESTS: usize = 8;
@@ -75,6 +75,44 @@ pub enum InternetStatus {
     Reachable,
     Missed,
     Failed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum BackupJobStatus {
+    Unknown,
+    NoJob,
+    Healthy,
+    Running,
+    Failed,
+    Stale,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FilesystemUsage {
+    pub used_percent: u8,
+    pub available_mib: u32,
+    pub mounted: bool,
+}
+
+impl FilesystemUsage {
+    pub const MISSING: Self = Self {
+        used_percent: 0,
+        available_mib: 0,
+        mounted: false,
+    };
+
+    #[must_use]
+    pub const fn new(used_percent: u8, available_mib: u32) -> Self {
+        Self {
+            used_percent: if used_percent > 100 {
+                100
+            } else {
+                used_percent
+            },
+            available_mib,
+            mounted: true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -186,8 +224,11 @@ pub struct HealthSnapshot {
     pub memory_total_mib: u32,
     pub io_pressure_percent: u8,
     pub load_average_x100: u16,
-    pub root_used_percent: u8,
-    pub backup_connected: bool,
+    pub root_storage: FilesystemUsage,
+    pub hdd_storage: FilesystemUsage,
+    pub backup_storage: FilesystemUsage,
+    pub backup_job_status: BackupJobStatus,
+    pub last_successful_backup_age_seconds: Option<u32>,
     pub network_up: bool,
     pub network_mbps: u16,
     pub internet_status: InternetStatus,
@@ -215,8 +256,11 @@ impl HealthSnapshot {
         memory_total_mib: u32,
         io_pressure_percent: u8,
         load_average_x100: u16,
-        root_used_percent: u8,
-        backup_connected: bool,
+        root_storage: FilesystemUsage,
+        hdd_storage: FilesystemUsage,
+        backup_storage: FilesystemUsage,
+        backup_job_status: BackupJobStatus,
+        last_successful_backup_age_seconds: Option<u32>,
         network_up: bool,
         network_mbps: u16,
         network_interface: &str,
@@ -242,8 +286,11 @@ impl HealthSnapshot {
             memory_total_mib,
             io_pressure_percent: io_pressure_percent.min(100),
             load_average_x100,
-            root_used_percent: root_used_percent.min(100),
-            backup_connected,
+            root_storage,
+            hdd_storage,
+            backup_storage,
+            backup_job_status,
+            last_successful_backup_age_seconds,
             network_up,
             network_mbps,
             internet_status,
@@ -505,8 +552,11 @@ mod tests {
                     32_768,
                     4,
                     82,
-                    72,
-                    true,
+                    FilesystemUsage::new(6, 85 * 1_024),
+                    FilesystemUsage::new(33, 6_186_598),
+                    FilesystemUsage::new(60, 3_670_016),
+                    BackupJobStatus::Healthy,
+                    Some(21_600),
                     true,
                     2_500,
                     "enp3s0",
@@ -635,8 +685,11 @@ mod tests {
                 0,
                 0,
                 0,
-                0,
-                false,
+                FilesystemUsage::MISSING,
+                FilesystemUsage::MISSING,
+                FilesystemUsage::MISSING,
+                BackupJobStatus::Unknown,
+                None,
                 true,
                 2_500,
                 "interface-name-too-long",
@@ -694,8 +747,11 @@ mod tests {
             u32::MAX,
             100,
             u16::MAX,
-            100,
-            true,
+            FilesystemUsage::new(100, u32::MAX),
+            FilesystemUsage::new(100, u32::MAX),
+            FilesystemUsage::new(100, u32::MAX),
+            BackupJobStatus::Failed,
+            Some(u32::MAX),
             true,
             u16::MAX,
             "123456789012345",

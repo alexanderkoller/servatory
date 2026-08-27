@@ -33,8 +33,9 @@ use mipidsi::{
     options::{ColorInversion, Orientation, Rotation},
 };
 use s3_display_protocol::{
-    ButtonAction, DeviceMessage, FrameDecoder, GuestKind, GuestStatus, HealthSnapshot, HostMessage,
-    InternetStatus, MAX_FRAME_LEN, decode_host, encode_device,
+    BackupJobStatus, ButtonAction, DeviceMessage, FilesystemUsage, FrameDecoder, GuestKind,
+    GuestStatus, HealthSnapshot, HostMessage, InternetStatus, MAX_FRAME_LEN, decode_host,
+    encode_device,
 };
 use static_cell::StaticCell;
 
@@ -781,37 +782,14 @@ where
     )
     .draw(display)
     .ok();
-    let mut root = String::<16>::new();
-    let _ = write!(&mut root, "{}%", snapshot.root_used_percent);
-    Text::new("ROOT", Point::new(10, 52), body)
-        .draw(display)
-        .ok();
+    draw_storage_row(display, 51, "/", snapshot.root_storage);
+    draw_storage_row(display, 69, "HDD", snapshot.hdd_storage);
+    draw_storage_row(display, 87, "BACKUP", snapshot.backup_storage);
+    let (backup_text, backup_color) = format_backup_job(snapshot);
     Text::new(
-        &root,
-        Point::new(58, 66),
-        MonoTextStyle::new(&FONT_10X20, usage_color(snapshot.root_used_percent)),
-    )
-    .draw(display)
-    .ok();
-    draw_bar(display, Point::new(10, 75), 98, snapshot.root_used_percent);
-    Text::new("BACKUP", Point::new(10, 99), body)
-        .draw(display)
-        .ok();
-    Text::new(
-        if snapshot.backup_connected {
-            "OK"
-        } else {
-            "MISSING"
-        },
-        Point::new(64, 112),
-        MonoTextStyle::new(
-            &FONT_6X10,
-            if snapshot.backup_connected {
-                Rgb565::GREEN
-            } else {
-                Rgb565::YELLOW
-            },
-        ),
+        &backup_text,
+        Point::new(10, 112),
+        MonoTextStyle::new(&FONT_6X10, backup_color),
     )
     .draw(display)
     .ok();
@@ -873,6 +851,158 @@ where
         )
         .draw(display)
         .ok();
+    }
+}
+
+fn draw_storage_row<D>(display: &mut D, baseline: i32, label: &str, usage: FilesystemUsage)
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let color = storage_color(usage);
+    Text::new(
+        label,
+        Point::new(10, baseline),
+        MonoTextStyle::new(&FONT_6X10, color),
+    )
+    .draw(display)
+    .ok();
+    if !usage.mounted {
+        Text::new(
+            "MISSING",
+            Point::new(70, baseline),
+            MonoTextStyle::new(&FONT_6X10, Rgb565::RED),
+        )
+        .draw(display)
+        .ok();
+        return;
+    }
+
+    // FONT_6X10's uppercase glyphs span from baseline - 7 through the baseline.
+    // A six-pixel bar at baseline - 6 shares the same visual center.
+    draw_storage_bar(
+        display,
+        Point::new(50, baseline - 6),
+        32,
+        usage.used_percent,
+        color,
+    );
+    let available = format_available_storage(usage.available_mib);
+    Text::new(
+        &available,
+        Point::new(
+            112 - i32::try_from(available.len()).unwrap_or(0) * 6,
+            baseline,
+        ),
+        MonoTextStyle::new(&FONT_6X10, color),
+    )
+    .draw(display)
+    .ok();
+}
+
+fn format_available_storage(available_mib: u32) -> String<8> {
+    let mut available = String::new();
+    if available_mib >= 1_048_576 {
+        let tenths = u64::from(available_mib).saturating_mul(10) / 1_048_576;
+        let _ = write!(&mut available, "{}.{}T", tenths / 10, tenths % 10);
+    } else if available_mib >= 1_024 {
+        let gib = (u64::from(available_mib) + 512) / 1_024;
+        let _ = write!(&mut available, "{gib}G");
+    } else {
+        let _ = write!(&mut available, "{available_mib}M");
+    }
+    available
+}
+
+fn format_backup_job(snapshot: &HealthSnapshot) -> (String<24>, Rgb565) {
+    let mut text = String::new();
+    let color = match snapshot.backup_job_status {
+        BackupJobStatus::Healthy => {
+            let _ = text.push_str("BACKUP OK ");
+            let _ = write_backup_age(
+                &mut text,
+                snapshot.last_successful_backup_age_seconds,
+                " AGO",
+            );
+            Rgb565::GREEN
+        }
+        BackupJobStatus::Running => {
+            let _ = text.push_str("BACKUP RUNNING");
+            if snapshot
+                .last_successful_backup_age_seconds
+                .is_none_or(|age| age > 24 * 60 * 60)
+            {
+                Rgb565::YELLOW
+            } else {
+                Rgb565::CYAN
+            }
+        }
+        BackupJobStatus::Failed => {
+            let _ = text.push_str("BACKUP FAILED");
+            Rgb565::YELLOW
+        }
+        BackupJobStatus::Stale => {
+            let _ = text.push_str("BACKUP ");
+            if snapshot.last_successful_backup_age_seconds.is_some() {
+                let _ = write_backup_age(
+                    &mut text,
+                    snapshot.last_successful_backup_age_seconds,
+                    " OLD",
+                );
+            } else {
+                let _ = text.push_str("OVERDUE");
+            }
+            Rgb565::YELLOW
+        }
+        BackupJobStatus::NoJob => {
+            let _ = text.push_str("BACKUP NO JOB");
+            Rgb565::YELLOW
+        }
+        BackupJobStatus::Unknown => {
+            let _ = text.push_str("BACKUP UNKNOWN");
+            Rgb565::RED
+        }
+    };
+    (text, color)
+}
+
+fn write_backup_age(text: &mut String<24>, age: Option<u32>, suffix: &str) -> core::fmt::Result {
+    let seconds = age.unwrap_or(0);
+    if seconds >= 2 * 86_400 {
+        write!(text, "{}d{suffix}", seconds / 86_400)
+    } else if seconds >= 3_600 {
+        write!(text, "{}h{suffix}", seconds / 3_600)
+    } else {
+        write!(text, "{}m{suffix}", seconds / 60)
+    }
+}
+
+fn storage_color(usage: FilesystemUsage) -> Rgb565 {
+    if !usage.mounted || usage.used_percent > 90 {
+        Rgb565::RED
+    } else {
+        Rgb565::GREEN
+    }
+}
+
+fn draw_storage_bar<D>(display: &mut D, origin: Point, width: u32, percent: u8, color: Rgb565)
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    Rectangle::new(origin, Size::new(width, 6))
+        .into_styled(
+            PrimitiveStyleBuilder::new()
+                .stroke_color(Rgb565::new(12, 25, 24))
+                .stroke_width(1)
+                .build(),
+        )
+        .draw(display)
+        .ok();
+    let filled = width.saturating_sub(2) * u32::from(percent) / 100;
+    if filled > 0 {
+        Rectangle::new(origin + Point::new(1, 1), Size::new(filled, 4))
+            .into_styled(PrimitiveStyleBuilder::new().fill_color(color).build())
+            .draw(display)
+            .ok();
     }
 }
 
@@ -1305,32 +1435,6 @@ where
         .ok();
 }
 
-fn draw_bar<D>(display: &mut D, origin: Point, width: u32, percent: u8)
-where
-    D: DrawTarget<Color = Rgb565>,
-{
-    Rectangle::new(origin, Size::new(width, 6))
-        .into_styled(
-            PrimitiveStyleBuilder::new()
-                .stroke_color(Rgb565::new(12, 25, 24))
-                .stroke_width(1)
-                .build(),
-        )
-        .draw(display)
-        .ok();
-    let filled = width.saturating_sub(2) * u32::from(percent) / 100;
-    if filled > 0 {
-        Rectangle::new(origin + Point::new(1, 1), Size::new(filled, 4))
-            .into_styled(
-                PrimitiveStyleBuilder::new()
-                    .fill_color(usage_color(percent))
-                    .build(),
-            )
-            .draw(display)
-            .ok();
-    }
-}
-
 fn draw_page_dots<D>(display: &mut D, page: u8)
 where
     D: DrawTarget<Color = Rgb565>,
@@ -1375,15 +1479,17 @@ fn health_status(snapshot: &HealthSnapshot) -> (&'static str, Rgb565) {
     let memory = memory_percent(snapshot);
     if !snapshot.network_up
         || snapshot.internet_status == InternetStatus::Failed
-        || snapshot.root_used_percent >= 95
+        || storage_is_critical(snapshot.root_storage)
+        || storage_is_critical(snapshot.hdd_storage)
+        || storage_is_critical(snapshot.backup_storage)
+        || snapshot.backup_job_status == BackupJobStatus::Unknown
     {
         ("CRITICAL", Rgb565::RED)
-    } else if !snapshot.backup_connected
-        || snapshot.internet_status == InternetStatus::Missed
+    } else if snapshot.internet_status == InternetStatus::Missed
         || snapshot.cpu_percent >= 85
         || memory >= 90
         || snapshot.io_pressure_percent >= 50
-        || snapshot.root_used_percent >= 85
+        || backup_has_warning(snapshot)
     {
         ("WARNING", Rgb565::YELLOW)
     } else {
@@ -1397,10 +1503,38 @@ fn critical_cause(snapshot: &HealthSnapshot) -> String<16> {
         let _ = cause.push_str("LINK DOWN");
     } else if snapshot.internet_status == InternetStatus::Failed {
         let _ = cause.push_str("PING FAILED");
-    } else if snapshot.root_used_percent >= 95 {
-        let _ = write!(&mut cause, "ROOT {}% FULL", snapshot.root_used_percent);
+    } else if storage_is_critical(snapshot.root_storage) {
+        write_storage_cause(&mut cause, "ROOT", snapshot.root_storage);
+    } else if storage_is_critical(snapshot.hdd_storage) {
+        write_storage_cause(&mut cause, "HDD", snapshot.hdd_storage);
+    } else if storage_is_critical(snapshot.backup_storage) {
+        write_storage_cause(&mut cause, "BACKUP", snapshot.backup_storage);
+    } else if snapshot.backup_job_status == BackupJobStatus::Unknown {
+        let _ = cause.push_str("BACKUP UNKNOWN");
     }
     cause
+}
+
+fn storage_is_critical(usage: FilesystemUsage) -> bool {
+    !usage.mounted || usage.used_percent > 90
+}
+
+fn backup_has_warning(snapshot: &HealthSnapshot) -> bool {
+    match snapshot.backup_job_status {
+        BackupJobStatus::Healthy | BackupJobStatus::Unknown => false,
+        BackupJobStatus::Running => snapshot
+            .last_successful_backup_age_seconds
+            .is_none_or(|age| age > 24 * 60 * 60),
+        BackupJobStatus::NoJob | BackupJobStatus::Failed | BackupJobStatus::Stale => true,
+    }
+}
+
+fn write_storage_cause(cause: &mut String<16>, label: &str, usage: FilesystemUsage) {
+    if usage.mounted {
+        let _ = write!(cause, "{label} {}% FULL", usage.used_percent);
+    } else {
+        let _ = write!(cause, "{label} MISSING");
+    }
 }
 
 fn resource_status_color(snapshot: &HealthSnapshot) -> Rgb565 {
