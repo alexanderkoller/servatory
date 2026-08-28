@@ -218,10 +218,7 @@ impl<S: Shutdown> EventHandler<S> {
                 }
                 Ok(false)
             }
-            DeviceMessage::Button(ButtonAction::NextScreen) => {
-                eprintln!("display selected the next screen");
-                Ok(false)
-            }
+            DeviceMessage::Button(ButtonAction::NextScreen) => Ok(false),
             DeviceMessage::Button(ButtonAction::ShutdownRequested) if self.allow_shutdown => {
                 write_host_message(HostMessage::ShutdownAccepted, output)?;
                 output.flush()?;

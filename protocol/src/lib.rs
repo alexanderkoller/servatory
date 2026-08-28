@@ -256,6 +256,131 @@ pub struct HealthSnapshot {
     network_interface: [u8; MAX_NETWORK_INTERFACE_LEN],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HealthStatus {
+    Healthy,
+    Warning(WarningCause),
+    Critical(CriticalCause),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WarningCause {
+    Cpu(u8),
+    Memory(u8),
+    IoPressure(u8),
+    BackupOverdue,
+    BackupFailed,
+    BackupNoJob,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CriticalCause {
+    LinkDown,
+    PingFailed,
+    RootStorage(FilesystemUsage),
+    HddStorage(FilesystemUsage),
+    BackupStorage(FilesystemUsage),
+    BackupUnknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HealthCause {
+    Warning(WarningCause),
+    Critical(CriticalCause),
+}
+
+impl HealthStatus {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Healthy => "HEALTHY",
+            Self::Warning(_) => "WARNING",
+            Self::Critical(_) => "CRITICAL",
+        }
+    }
+
+    #[must_use]
+    pub const fn cause(self) -> Option<HealthCause> {
+        match self {
+            Self::Healthy => None,
+            Self::Warning(cause) => Some(HealthCause::Warning(cause)),
+            Self::Critical(cause) => Some(HealthCause::Critical(cause)),
+        }
+    }
+
+    /// Returns whether two statuses represent the same condition, ignoring
+    /// changing measurements such as CPU percentage and free storage.
+    #[must_use]
+    pub fn same_condition(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Healthy, Self::Healthy) => true,
+            (Self::Warning(left), Self::Warning(right)) => {
+                core::mem::discriminant(&left) == core::mem::discriminant(&right)
+            }
+            (Self::Critical(left), Self::Critical(right)) => {
+                core::mem::discriminant(&left) == core::mem::discriminant(&right)
+            }
+            _ => false,
+        }
+    }
+}
+
+impl fmt::Display for HealthStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.cause() {
+            Some(cause) => write!(f, "{}: {cause}", self.label()),
+            None => f.write_str(self.label()),
+        }
+    }
+}
+
+impl fmt::Display for HealthCause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Warning(cause) => cause.fmt(f),
+            Self::Critical(cause) => cause.fmt(f),
+        }
+    }
+}
+
+impl fmt::Display for WarningCause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cpu(percent) => write!(f, "CPU {percent}%"),
+            Self::Memory(percent) => write!(f, "MEMORY {percent}%"),
+            Self::IoPressure(percent) => write!(f, "IO PRESS {percent}%"),
+            Self::BackupOverdue => f.write_str("BACKUP OVERDUE"),
+            Self::BackupFailed => f.write_str("BACKUP FAILED"),
+            Self::BackupNoJob => f.write_str("BACKUP NO JOB"),
+        }
+    }
+}
+
+impl fmt::Display for CriticalCause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LinkDown => f.write_str("LINK DOWN"),
+            Self::PingFailed => f.write_str("PING FAILED"),
+            Self::RootStorage(usage) => write_storage_cause(f, "ROOT", *usage),
+            Self::HddStorage(usage) => write_storage_cause(f, "HDD", *usage),
+            Self::BackupStorage(usage) => write_storage_cause(f, "BACKUP", *usage),
+            Self::BackupUnknown => f.write_str("BACKUP UNKNOWN"),
+        }
+    }
+}
+
+fn write_storage_cause(
+    f: &mut fmt::Formatter<'_>,
+    label: &str,
+    usage: FilesystemUsage,
+) -> fmt::Result {
+    if usage.mounted {
+        write!(f, "{label} {}% FULL", usage.used_percent)
+    } else {
+        write!(f, "{label} MISSING")
+    }
+}
+
 impl HealthSnapshot {
     /// Creates a bounded, allocation-free host-health snapshot.
     ///
@@ -329,6 +454,65 @@ impl HealthSnapshot {
     pub fn network_interface(&self) -> &str {
         let len = usize::from(self.network_interface_len).min(MAX_NETWORK_INTERFACE_LEN);
         core::str::from_utf8(&self.network_interface[..len]).unwrap_or("?")
+    }
+
+    #[must_use]
+    pub fn health_status(&self) -> HealthStatus {
+        if !self.network_up {
+            return HealthStatus::Critical(CriticalCause::LinkDown);
+        } else if self.internet_status == InternetStatus::Failed {
+            return HealthStatus::Critical(CriticalCause::PingFailed);
+        } else if storage_is_critical(self.root_storage) {
+            return HealthStatus::Critical(CriticalCause::RootStorage(self.root_storage));
+        } else if storage_is_critical(self.hdd_storage) {
+            return HealthStatus::Critical(CriticalCause::HddStorage(self.hdd_storage));
+        } else if storage_is_critical(self.backup_storage) {
+            return HealthStatus::Critical(CriticalCause::BackupStorage(self.backup_storage));
+        } else if self.backup_job_status == BackupJobStatus::Unknown {
+            return HealthStatus::Critical(CriticalCause::BackupUnknown);
+        }
+
+        let memory = memory_percent(self);
+        if self.cpu_percent >= 85 {
+            HealthStatus::Warning(WarningCause::Cpu(self.cpu_percent))
+        } else if memory >= 90 {
+            HealthStatus::Warning(WarningCause::Memory(memory))
+        } else if self.io_pressure_percent >= 50 {
+            HealthStatus::Warning(WarningCause::IoPressure(self.io_pressure_percent))
+        } else if let Some(cause) = backup_warning_cause(self) {
+            HealthStatus::Warning(cause)
+        } else {
+            HealthStatus::Healthy
+        }
+    }
+}
+
+fn storage_is_critical(usage: FilesystemUsage) -> bool {
+    !usage.mounted || usage.used_percent > 90
+}
+
+fn memory_percent(snapshot: &HealthSnapshot) -> u8 {
+    if snapshot.memory_total_mib == 0 {
+        0
+    } else {
+        u8::try_from(
+            u64::from(snapshot.memory_used_mib).saturating_mul(100)
+                / u64::from(snapshot.memory_total_mib),
+        )
+        .unwrap_or(100)
+    }
+}
+
+fn backup_warning_cause(snapshot: &HealthSnapshot) -> Option<WarningCause> {
+    match snapshot.backup_job_status {
+        BackupJobStatus::Healthy | BackupJobStatus::Unknown => None,
+        BackupJobStatus::Running => snapshot
+            .last_successful_backup_age_seconds
+            .is_none_or(|age| age > 24 * 60 * 60)
+            .then_some(WarningCause::BackupOverdue),
+        BackupJobStatus::NoJob => Some(WarningCause::BackupNoJob),
+        BackupJobStatus::Failed => Some(WarningCause::BackupFailed),
+        BackupJobStatus::Stale => Some(WarningCause::BackupOverdue),
     }
 }
 
@@ -541,6 +725,75 @@ mod tests {
     extern crate std;
 
     use super::*;
+
+    fn healthy_snapshot() -> HealthSnapshot {
+        HealthSnapshot::new(
+            "pve-01",
+            86_400,
+            23,
+            16_384,
+            32_768,
+            4,
+            82,
+            FilesystemUsage::new(20, 80 * 1_024),
+            FilesystemUsage::new(30, 7_000 * 1_024),
+            FilesystemUsage::new(40, 4_000 * 1_024),
+            BackupJobStatus::Healthy,
+            Some(21_600),
+            true,
+            2_500,
+            "enp3s0",
+            InternetStatus::Reachable,
+            Some(0),
+            [10, 0, 0, 12],
+            GuestSnapshot::EMPTY,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn health_statuses_always_carry_typed_causes() {
+        let mut snapshot = healthy_snapshot();
+        assert_eq!(snapshot.health_status(), HealthStatus::Healthy);
+        assert_eq!(snapshot.health_status().cause(), None);
+
+        snapshot.internet_status = InternetStatus::Missed;
+        assert_eq!(snapshot.health_status(), HealthStatus::Healthy);
+
+        snapshot.cpu_percent = 85;
+        let warning = snapshot.health_status();
+        assert_eq!(warning, HealthStatus::Warning(WarningCause::Cpu(85)));
+        assert_eq!(
+            warning.cause(),
+            Some(HealthCause::Warning(WarningCause::Cpu(85)))
+        );
+
+        snapshot.network_up = false;
+        let critical = snapshot.health_status();
+        assert_eq!(critical, HealthStatus::Critical(CriticalCause::LinkDown));
+        assert_eq!(
+            critical.cause(),
+            Some(HealthCause::Critical(CriticalCause::LinkDown))
+        );
+    }
+
+    #[test]
+    fn changing_measurements_do_not_create_new_health_conditions() {
+        assert!(
+            HealthStatus::Warning(WarningCause::Cpu(85))
+                .same_condition(HealthStatus::Warning(WarningCause::Cpu(99)))
+        );
+        assert!(
+            HealthStatus::Critical(CriticalCause::RootStorage(FilesystemUsage::new(91, 100)))
+                .same_condition(HealthStatus::Critical(CriticalCause::RootStorage(
+                    FilesystemUsage::new(99, 10),
+                )))
+        );
+        assert!(
+            !HealthStatus::Warning(WarningCause::Cpu(99))
+                .same_condition(HealthStatus::Warning(WarningCause::Memory(99)))
+        );
+    }
 
     #[test]
     fn messages_round_trip_as_typed_values() {

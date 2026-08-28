@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use s3_display_host::{EventHandler, SystemdShutdown, write_host_message};
 use s3_display_protocol::{
-    FrameDecoder, HostMessage, MAX_FRAME_LEN, Sequence, UnixSeconds, decode_device,
+    FrameDecoder, HealthStatus, HostMessage, MAX_FRAME_LEN, Sequence, UnixSeconds, decode_device,
 };
 
 mod health;
@@ -42,6 +42,7 @@ fn main() -> Result<()> {
     let mut handler = EventHandler::new(SystemdShutdown, args.allow_shutdown);
     let mut input = [0_u8; 64];
     let mut health = HealthCollector::default();
+    let mut last_health_status = None;
     let mut port = None;
     let mut waiting_logged = false;
 
@@ -74,15 +75,15 @@ fn main() -> Result<()> {
         let mut connection_error = None;
 
         if Instant::now() >= next_update {
-            let unix_seconds = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .context("system clock is before the Unix epoch")?
-                .as_secs();
+            let unix_seconds = current_unix_seconds()?;
+            let snapshot = health.collect();
+            let status = snapshot.health_status();
+            log_health_status_change(&mut last_health_status, status);
             if let Err(error) = write_host_message(
                 HostMessage::HealthSnapshot {
                     sequence,
                     unix_seconds: UnixSeconds::new(unix_seconds),
-                    snapshot: health.collect(),
+                    snapshot,
                 },
                 connected_port,
             ) {
@@ -134,5 +135,68 @@ fn main() -> Result<()> {
             waiting_logged = true;
             thread::sleep(reconnect_delay);
         }
+    }
+}
+
+fn current_unix_seconds() -> Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_secs())
+}
+
+fn log_health_status_change(previous: &mut Option<HealthStatus>, current: HealthStatus) {
+    if changed_health_status(*previous, current).is_none() {
+        return;
+    }
+    match current {
+        HealthStatus::Healthy if previous.is_some() => {
+            eprintln!("health status: HEALTHY (recovered)");
+        }
+        HealthStatus::Healthy => {}
+        HealthStatus::Warning(_) | HealthStatus::Critical(_) => {
+            eprintln!("health status: {current}");
+        }
+    }
+    *previous = Some(current);
+}
+
+fn changed_health_status(
+    previous: Option<HealthStatus>,
+    current: HealthStatus,
+) -> Option<HealthStatus> {
+    previous
+        .is_none_or(|previous| !current.same_condition(previous))
+        .then_some(current)
+}
+
+#[cfg(test)]
+mod tests {
+    use s3_display_protocol::{CriticalCause, WarningCause};
+
+    use super::*;
+
+    #[test]
+    fn logs_initial_problems_changes_and_recovery_once() {
+        let warning = HealthStatus::Warning(WarningCause::Cpu(85));
+        assert_eq!(changed_health_status(None, warning), Some(warning));
+        assert_eq!(
+            changed_health_status(Some(warning), HealthStatus::Warning(WarningCause::Cpu(99))),
+            None
+        );
+
+        let critical = HealthStatus::Critical(CriticalCause::PingFailed);
+        assert_eq!(
+            changed_health_status(Some(warning), critical),
+            Some(critical)
+        );
+        assert_eq!(
+            changed_health_status(Some(critical), HealthStatus::Healthy),
+            Some(HealthStatus::Healthy)
+        );
+        assert_eq!(
+            changed_health_status(Some(HealthStatus::Healthy), HealthStatus::Healthy),
+            None
+        );
     }
 }

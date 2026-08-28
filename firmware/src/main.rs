@@ -34,8 +34,8 @@ use mipidsi::{
 };
 use s3_display_protocol::{
     BackupJobStatus, ButtonAction, DeviceMessage, FilesystemUsage, FrameDecoder, GuestKind,
-    GuestStatus, HealthSnapshot, HostMessage, InternetStatus, MAX_FRAME_LEN, ShutdownFailure,
-    ShutdownPhase, decode_host, encode_device,
+    GuestStatus, HealthSnapshot, HealthStatus, HostMessage, InternetStatus, MAX_FRAME_LEN,
+    ShutdownFailure, ShutdownPhase, decode_host, encode_device,
 };
 use static_cell::StaticCell;
 
@@ -727,9 +727,9 @@ fn render<D>(
     let accent = match daemon {
         DaemonState::PoweringOff => Rgb565::RED,
         DaemonState::Stale => Rgb565::YELLOW,
-        DaemonState::Connected => {
-            health_snapshot.map_or(Rgb565::CYAN, |snapshot| health_status(&snapshot).color())
-        }
+        DaemonState::Connected => health_snapshot.map_or(Rgb565::CYAN, |snapshot| {
+            health_status_color(snapshot.health_status())
+        }),
         DaemonState::Waiting => Rgb565::CYAN,
     };
     Rectangle::new(Point::new(0, 0), Size::new(u32::from(DISPLAY_WIDTH), 3))
@@ -802,8 +802,8 @@ where
 {
     draw_header(display, snapshot, "OVERVIEW", 0);
     draw_card(display, Point::new(4, 19), Size::new(95, 103));
-    let status = health_status(snapshot);
-    let status_color = status.color();
+    let status = snapshot.health_status();
+    let status_color = health_status_color(status);
     Text::new(
         status.label(),
         Point::new(12, 46),
@@ -822,7 +822,9 @@ where
     )
     .draw(display)
     .ok();
-    if let Some(cause) = status.cause_text() {
+    if let Some(status_cause) = status.cause() {
+        let mut cause = String::<16>::new();
+        let _ = write!(&mut cause, "{status_cause}");
         Text::new(
             "CAUSE",
             Point::new(12, 91),
@@ -1767,146 +1769,11 @@ where
     }
 }
 
-#[derive(Clone, Copy)]
-enum HealthStatus {
-    Healthy,
-    Warning(WarningCause),
-    Critical(CriticalCause),
-}
-
-#[derive(Clone, Copy)]
-enum WarningCause {
-    Cpu(u8),
-    Memory(u8),
-    IoPressure(u8),
-    BackupOverdue,
-    BackupFailed,
-    BackupNoJob,
-}
-
-#[derive(Clone, Copy)]
-enum CriticalCause {
-    LinkDown,
-    PingFailed,
-    RootStorage(FilesystemUsage),
-    HddStorage(FilesystemUsage),
-    BackupStorage(FilesystemUsage),
-    BackupUnknown,
-}
-
-impl HealthStatus {
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Healthy => "HEALTHY",
-            Self::Warning(_) => "WARNING",
-            Self::Critical(_) => "CRITICAL",
-        }
-    }
-
-    const fn color(self) -> Rgb565 {
-        match self {
-            Self::Healthy => Rgb565::GREEN,
-            Self::Warning(_) => Rgb565::YELLOW,
-            Self::Critical(_) => Rgb565::RED,
-        }
-    }
-
-    fn cause_text(self) -> Option<String<16>> {
-        let mut cause = String::new();
-        match self {
-            Self::Healthy => return None,
-            Self::Warning(WarningCause::Cpu(percent)) => {
-                let _ = write!(&mut cause, "CPU {percent}%");
-            }
-            Self::Warning(WarningCause::Memory(percent)) => {
-                let _ = write!(&mut cause, "MEMORY {percent}%");
-            }
-            Self::Warning(WarningCause::IoPressure(percent)) => {
-                let _ = write!(&mut cause, "IO PRESS {percent}%");
-            }
-            Self::Warning(WarningCause::BackupOverdue) => {
-                let _ = cause.push_str("BACKUP OVERDUE");
-            }
-            Self::Warning(WarningCause::BackupFailed) => {
-                let _ = cause.push_str("BACKUP FAILED");
-            }
-            Self::Warning(WarningCause::BackupNoJob) => {
-                let _ = cause.push_str("BACKUP NO JOB");
-            }
-            Self::Critical(CriticalCause::LinkDown) => {
-                let _ = cause.push_str("LINK DOWN");
-            }
-            Self::Critical(CriticalCause::PingFailed) => {
-                let _ = cause.push_str("PING FAILED");
-            }
-            Self::Critical(CriticalCause::RootStorage(usage)) => {
-                write_storage_cause(&mut cause, "ROOT", usage);
-            }
-            Self::Critical(CriticalCause::HddStorage(usage)) => {
-                write_storage_cause(&mut cause, "HDD", usage);
-            }
-            Self::Critical(CriticalCause::BackupStorage(usage)) => {
-                write_storage_cause(&mut cause, "BACKUP", usage);
-            }
-            Self::Critical(CriticalCause::BackupUnknown) => {
-                let _ = cause.push_str("BACKUP UNKNOWN");
-            }
-        }
-        Some(cause)
-    }
-}
-
-fn health_status(snapshot: &HealthSnapshot) -> HealthStatus {
-    if !snapshot.network_up {
-        return HealthStatus::Critical(CriticalCause::LinkDown);
-    } else if snapshot.internet_status == InternetStatus::Failed {
-        return HealthStatus::Critical(CriticalCause::PingFailed);
-    } else if storage_is_critical(snapshot.root_storage) {
-        return HealthStatus::Critical(CriticalCause::RootStorage(snapshot.root_storage));
-    } else if storage_is_critical(snapshot.hdd_storage) {
-        return HealthStatus::Critical(CriticalCause::HddStorage(snapshot.hdd_storage));
-    } else if storage_is_critical(snapshot.backup_storage) {
-        return HealthStatus::Critical(CriticalCause::BackupStorage(snapshot.backup_storage));
-    } else if snapshot.backup_job_status == BackupJobStatus::Unknown {
-        return HealthStatus::Critical(CriticalCause::BackupUnknown);
-    }
-
-    let memory = memory_percent(snapshot);
-    if snapshot.cpu_percent >= 85 {
-        HealthStatus::Warning(WarningCause::Cpu(snapshot.cpu_percent))
-    } else if memory >= 90 {
-        HealthStatus::Warning(WarningCause::Memory(memory))
-    } else if snapshot.io_pressure_percent >= 50 {
-        HealthStatus::Warning(WarningCause::IoPressure(snapshot.io_pressure_percent))
-    } else if let Some(cause) = backup_warning_cause(snapshot) {
-        HealthStatus::Warning(cause)
-    } else {
-        HealthStatus::Healthy
-    }
-}
-
-fn storage_is_critical(usage: FilesystemUsage) -> bool {
-    !usage.mounted || usage.used_percent > 90
-}
-
-fn backup_warning_cause(snapshot: &HealthSnapshot) -> Option<WarningCause> {
-    match snapshot.backup_job_status {
-        BackupJobStatus::Healthy | BackupJobStatus::Unknown => None,
-        BackupJobStatus::Running => snapshot
-            .last_successful_backup_age_seconds
-            .is_none_or(|age| age > 24 * 60 * 60)
-            .then_some(WarningCause::BackupOverdue),
-        BackupJobStatus::NoJob => Some(WarningCause::BackupNoJob),
-        BackupJobStatus::Failed => Some(WarningCause::BackupFailed),
-        BackupJobStatus::Stale => Some(WarningCause::BackupOverdue),
-    }
-}
-
-fn write_storage_cause(cause: &mut String<16>, label: &str, usage: FilesystemUsage) {
-    if usage.mounted {
-        let _ = write!(cause, "{label} {}% FULL", usage.used_percent);
-    } else {
-        let _ = write!(cause, "{label} MISSING");
+const fn health_status_color(status: HealthStatus) -> Rgb565 {
+    match status {
+        HealthStatus::Healthy => Rgb565::GREEN,
+        HealthStatus::Warning(_) => Rgb565::YELLOW,
+        HealthStatus::Critical(_) => Rgb565::RED,
     }
 }
 
