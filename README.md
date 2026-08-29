@@ -2,7 +2,7 @@
 
 This repository contains a tiny USB-connected Proxmox health display. Its
 240x135 landscape Split View shows an overview followed by resources,
-storage/network, and two guest-list screens.
+filesystems/SMART, UPS/Ethernet, and two guest-list screens.
 
 - `firmware/`: allocation-free Rust firmware for the M5Stick S3 (ESP32-S3).
 - `host/`: Linux daemon that sends regular updates and handles button events.
@@ -22,7 +22,7 @@ session. All USB transmission is non-blocking, and shutdown requests are never
 queued across disconnected sessions. After an accepted shutdown, the first
 valid update from the rebooted host returns the display to its normal status.
 
-The front button changes between five health screens on a short press. The two
+The front button changes between six health screens on a short press. The two
 guest screens expose all eight entries supported by the protocol. Holding it
 for three seconds during a live daemon session sends a shutdown request. The host
 acknowledges that request and immediately queues `/usr/bin/systemctl poweroff`.
@@ -152,6 +152,14 @@ To check it later:
 ssh alex@pve.local systemctl status s3-display.service
 ```
 
+The installed service queries the local NUT server as `eaton@localhost` and
+monitors `/dev/sda` through `/dev/sde` with the display labels `ROOT`, `HDD`,
+`BACKUP`, `SDD`, and `SDE`. Adjust the `--ups` and repeated `--smart-device`
+arguments in `deploy/s3-display.service` when deploying to a different host.
+UPS access is status-only and anonymous; the daemon never uses NUT control or
+shutdown credentials. SMART collection requires `smartctl` with JSON support
+and uses `-n standby`, so a health update does not wake a sleeping disk.
+
 ### Manual installation on Proxmox
 
 If you already have the matching static Linux binary, copy it to the Proxmox
@@ -181,6 +189,18 @@ the active physical port, and reads that port's carrier and negotiated speed
 from `/sys/class/net`. This avoids mistaking a fast virtual guest interface for
 the host's Ethernet connection.
 
+UPS health comes from the read-only `upsc` status fields for battery charge,
+runtime, load, state, and approximate real power. The watt figure is displayed
+with a `~` marker and never drives health decisions. On-battery and bypass states
+are warnings; low battery, replace-battery, and output-off states are critical.
+Two consecutive query failures produce an unavailable warning, while the first
+failure retains the last values as stale.
+
+SMART health is collected for up to five explicitly named disks. Each row shows
+the human-readable label, health state, and temperature when available. Sleeping
+disks are neutral, unknown or degraded results are warnings, and a failed SMART
+self-assessment is critical.
+
 An asynchronous IPv4 ping to `www.google.de` runs every 30 seconds with a hard
 four-second timeout. After a link comes up, the daemon allows three seconds for
 the network path to settle; if that first probe misses, it retries after five
@@ -194,7 +214,7 @@ successful backup older than 24 hours produces a warning. Guest state comes from
 display.
 
 The mock host sends deterministic values matching the Split View design, so all
-five pages can be exercised away from a Proxmox installation.
+six pages can be exercised away from a Proxmox installation.
 
 ## Wire protocol
 

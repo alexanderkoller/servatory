@@ -35,7 +35,8 @@ use mipidsi::{
 use s3_display_protocol::{
     BackupJobStatus, ButtonAction, DeviceMessage, FilesystemUsage, FrameDecoder, GuestKind,
     GuestStatus, HealthSnapshot, HealthStatus, HostMessage, InternetStatus, MAX_FRAME_LEN,
-    ShutdownFailure, ShutdownPhase, decode_host, encode_device,
+    ShutdownFailure, ShutdownPhase, SmartDeviceSummary, SmartStatus, UpsStatus, decode_host,
+    encode_device,
 };
 use static_cell::StaticCell;
 
@@ -66,7 +67,7 @@ const SHUTDOWN_SPINNER_INTERVAL: Duration = Duration::from_millis(250);
 const SHUTDOWN_REPORT_TIMEOUT: Duration = Duration::from_secs(3);
 const SHUTDOWN_USB_LOST_CONFIRM: Duration = Duration::from_secs(2);
 const MAX_DEVICE_FRAME_LEN: usize = 64;
-const PAGE_COUNT: u8 = 5;
+const PAGE_COUNT: u8 = 6;
 const GUESTS_PER_PAGE: usize = 4;
 const M5PM1_ADDRESS: u8 = 0x6e;
 const M5PM1_GPIO2_MASK: u8 = 1 << 2;
@@ -108,6 +109,7 @@ enum UiIcon {
     Cpu,
     Memory,
     Disk,
+    Ups,
     Network,
     Guests,
     Qemu,
@@ -748,8 +750,9 @@ fn render<D>(
             match page % PAGE_COUNT {
                 0 => draw_overview(framebuffer, &snapshot),
                 1 => draw_resources(framebuffer, &snapshot),
-                2 => draw_storage_network(framebuffer, &snapshot),
-                guest_page => draw_guests(framebuffer, &snapshot, guest_page - 3),
+                2 => draw_storage_smart(framebuffer, &snapshot),
+                3 => draw_ups_network(framebuffer, &snapshot),
+                guest_page => draw_guests(framebuffer, &snapshot, guest_page - 4),
             }
             draw_page_dots(framebuffer, page % PAGE_COUNT);
         }
@@ -932,17 +935,16 @@ where
     draw_value_card(display, Point::new(122, 72), UiIcon::Load, "LOAD", &load);
 }
 
-fn draw_storage_network<D>(display: &mut D, snapshot: &HealthSnapshot)
+fn draw_storage_smart<D>(display: &mut D, snapshot: &HealthSnapshot)
 where
     D: DrawTarget<Color = Rgb565>,
 {
-    draw_header(display, snapshot, "STORAGE + NET", 2);
+    draw_header(display, snapshot, "STORAGE + SMART", 2);
     let cyan = Rgb565::new(0, 48, 31);
-    let body = MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE);
     draw_card(display, Point::new(4, 19), Size::new(114, 103));
     draw_icon(display, UiIcon::Disk, Point::new(10, 24), cyan);
     Text::new(
-        "STORAGE",
+        "FILESYSTEMS",
         Point::new(30, 34),
         MonoTextStyle::new(&FONT_6X10, cyan),
     )
@@ -961,9 +963,66 @@ where
     .ok();
 
     draw_card(display, Point::new(122, 19), Size::new(114, 103));
+    draw_icon(display, UiIcon::Disk, Point::new(128, 24), cyan);
+    Text::new(
+        "SMART",
+        Point::new(148, 34),
+        MonoTextStyle::new(&FONT_6X10, cyan),
+    )
+    .draw(display)
+    .ok();
+    if snapshot.smart.devices().is_empty() {
+        Text::new(
+            "NOT CONFIGURED",
+            Point::new(128, 58),
+            MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE),
+        )
+        .draw(display)
+        .ok();
+    } else {
+        for (row, device) in snapshot.smart.devices().iter().enumerate() {
+            draw_smart_row(display, 51 + i32::try_from(row).unwrap_or(0) * 17, device);
+        }
+    }
+}
+
+fn draw_ups_network<D>(display: &mut D, snapshot: &HealthSnapshot)
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    draw_header(display, snapshot, "UPS + ETHERNET", 3);
+    let cyan = Rgb565::new(0, 48, 31);
+    let body = MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE);
+    draw_card(display, Point::new(4, 19), Size::new(114, 103));
+    draw_icon(display, UiIcon::Ups, Point::new(10, 24), cyan);
+    Text::new(
+        "UPS",
+        Point::new(30, 34),
+        MonoTextStyle::new(&FONT_6X10, cyan),
+    )
+    .draw(display)
+    .ok();
+    Text::new(
+        ups_status_text(snapshot),
+        Point::new(10, 57),
+        MonoTextStyle::new(&FONT_10X20, ups_color(snapshot)),
+    )
+    .draw(display)
+    .ok();
+    Text::new(&format_ups_battery(snapshot), Point::new(10, 76), body)
+        .draw(display)
+        .ok();
+    Text::new(&format_ups_load(snapshot), Point::new(10, 92), body)
+        .draw(display)
+        .ok();
+    Text::new(&format_ups_runtime(snapshot), Point::new(10, 108), body)
+        .draw(display)
+        .ok();
+
+    draw_card(display, Point::new(122, 19), Size::new(114, 103));
     draw_icon(display, UiIcon::Network, Point::new(128, 24), cyan);
     Text::new(
-        "NETWORK",
+        "ETHERNET",
         Point::new(148, 34),
         MonoTextStyle::new(&FONT_6X10, cyan),
     )
@@ -1018,6 +1077,132 @@ where
         .draw(display)
         .ok();
     }
+}
+
+fn draw_smart_row<D>(display: &mut D, baseline: i32, device: &SmartDeviceSummary)
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let color = smart_color(device.status);
+    Text::new(
+        device.label(),
+        Point::new(128, baseline),
+        MonoTextStyle::new(&FONT_6X10, color),
+    )
+    .draw(display)
+    .ok();
+    let detail = format_smart_detail(device);
+    Text::new(
+        &detail,
+        Point::new(230 - i32::try_from(detail.len()).unwrap_or(0) * 6, baseline),
+        MonoTextStyle::new(&FONT_6X10, color),
+    )
+    .draw(display)
+    .ok();
+}
+
+fn format_smart_detail(device: &SmartDeviceSummary) -> String<12> {
+    let mut text = String::new();
+    let _ = text.push_str(match device.status {
+        SmartStatus::Healthy => "OK",
+        SmartStatus::Warning => "WARN",
+        SmartStatus::Failed => "FAIL",
+        SmartStatus::Sleeping => "SLEEP",
+        SmartStatus::Unknown => "UNK",
+    });
+    if let Some(temperature) = device.temperature_celsius {
+        let _ = write!(&mut text, " {temperature}C");
+    } else if device.status == SmartStatus::Sleeping {
+        let _ = text.push_str(" --");
+    }
+    text
+}
+
+const fn smart_color(status: SmartStatus) -> Rgb565 {
+    match status {
+        SmartStatus::Healthy => Rgb565::GREEN,
+        SmartStatus::Sleeping => Rgb565::CYAN,
+        SmartStatus::Warning | SmartStatus::Unknown => Rgb565::YELLOW,
+        SmartStatus::Failed => Rgb565::RED,
+    }
+}
+
+fn ups_status_text(snapshot: &HealthSnapshot) -> &'static str {
+    if snapshot.ups.stale && snapshot.ups.status != UpsStatus::Unavailable {
+        return "STALE";
+    }
+    match snapshot.ups.status {
+        UpsStatus::NotConfigured => "NO UPS",
+        UpsStatus::Unknown | UpsStatus::Unavailable => "NO DATA",
+        UpsStatus::Online => "ONLINE",
+        UpsStatus::OnBattery => "ON BATTERY",
+        UpsStatus::LowBattery => "LOW BATTERY",
+        UpsStatus::Charging => "CHARGING",
+        UpsStatus::Bypass => "BYPASS",
+        UpsStatus::OutputOff => "OUTPUT OFF",
+        UpsStatus::ReplaceBattery => "REPLACE BAT",
+    }
+}
+
+fn ups_color(snapshot: &HealthSnapshot) -> Rgb565 {
+    match snapshot.ups.status {
+        UpsStatus::Online | UpsStatus::Charging => Rgb565::GREEN,
+        UpsStatus::NotConfigured => Rgb565::WHITE,
+        UpsStatus::OnBattery | UpsStatus::Bypass | UpsStatus::Unknown | UpsStatus::Unavailable => {
+            Rgb565::YELLOW
+        }
+        UpsStatus::LowBattery | UpsStatus::OutputOff | UpsStatus::ReplaceBattery => Rgb565::RED,
+    }
+}
+
+fn format_ups_battery(snapshot: &HealthSnapshot) -> String<16> {
+    let mut text = String::new();
+    match snapshot.ups.battery_percent {
+        Some(percent) => {
+            let _ = write!(&mut text, "BAT       {percent}%");
+        }
+        None => {
+            let _ = text.push_str("BAT        --");
+        }
+    }
+    text
+}
+
+fn format_ups_load(snapshot: &HealthSnapshot) -> String<20> {
+    let mut text = String::new();
+    match (snapshot.ups.load_percent, snapshot.ups.estimated_watts) {
+        (Some(load), Some(watts)) => {
+            let _ = write!(&mut text, "LOAD {load}% ~{watts}W");
+        }
+        (Some(load), None) => {
+            let _ = write!(&mut text, "LOAD      {load}%");
+        }
+        (None, _) => {
+            let _ = text.push_str("LOAD       --");
+        }
+    }
+    text
+}
+
+fn format_ups_runtime(snapshot: &HealthSnapshot) -> String<20> {
+    let mut text = String::new();
+    match snapshot.ups.runtime_seconds {
+        Some(seconds) if seconds >= 3_600 => {
+            let _ = write!(
+                &mut text,
+                "RUNTIME {}h{}m",
+                seconds / 3_600,
+                seconds % 3_600 / 60
+            );
+        }
+        Some(seconds) => {
+            let _ = write!(&mut text, "RUNTIME    {}m", seconds / 60);
+        }
+        None => {
+            let _ = text.push_str("RUNTIME    --");
+        }
+    }
+    text
 }
 
 fn draw_storage_row<D>(display: &mut D, baseline: i32, label: &str, usage: FilesystemUsage)
@@ -1185,7 +1370,7 @@ where
         } else {
             "GUESTS 2/2"
         },
-        3 + u8::try_from(page).unwrap_or(0),
+        4 + u8::try_from(page).unwrap_or(0),
     );
     let cyan = Rgb565::new(0, 48, 31);
     let body = MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE);
@@ -1455,6 +1640,20 @@ where
                 .draw(display)
                 .ok();
         }
+        UiIcon::Ups => {
+            Rectangle::new(origin + Point::new(2, 3), Size::new(12, 11))
+                .into_styled(stroke)
+                .draw(display)
+                .ok();
+            Rectangle::new(origin + Point::new(6, 1), Size::new(4, 2))
+                .into_styled(fill)
+                .draw(display)
+                .ok();
+            Rectangle::new(origin + Point::new(5, 6), Size::new(6, 5))
+                .into_styled(fill)
+                .draw(display)
+                .ok();
+        }
         UiIcon::Network => {
             Rectangle::new(origin + Point::new(5, 5), Size::new(6, 5))
                 .into_styled(stroke)
@@ -1606,7 +1805,7 @@ where
     D: DrawTarget<Color = Rgb565>,
 {
     for index in 0..i32::from(PAGE_COUNT) {
-        Rectangle::new(Point::new(100 + index * 10, 129), Size::new(5, 3))
+        Rectangle::new(Point::new(92 + index * 10, 129), Size::new(5, 3))
             .into_styled(
                 PrimitiveStyleBuilder::new()
                     .fill_color(if index == i32::from(page) {

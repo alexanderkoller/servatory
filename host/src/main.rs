@@ -9,12 +9,13 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use s3_display_host::{EventHandler, SystemdShutdown, write_host_message};
 use s3_display_protocol::{
-    FrameDecoder, HealthStatus, HostMessage, MAX_FRAME_LEN, Sequence, UnixSeconds, decode_device,
+    FrameDecoder, HealthStatus, HostMessage, MAX_FRAME_LEN, MAX_SMART_DEVICES, MAX_SMART_LABEL_LEN,
+    Sequence, UnixSeconds, decode_device,
 };
 
 mod health;
 
-use health::HealthCollector;
+use health::{HealthCollector, SmartDeviceConfig};
 
 #[derive(Debug, Parser)]
 #[command(about = "Update an M5Stick S3 display over USB")]
@@ -30,6 +31,14 @@ struct Args {
     /// Permit a long press on the device to invoke `systemctl poweroff`.
     #[arg(long)]
     allow_shutdown: bool,
+
+    /// Read-only NUT endpoint to query with upsc (for example eaton@localhost).
+    #[arg(long)]
+    ups: Option<String>,
+
+    /// SMART row in LABEL=/dev/path form; may be repeated up to five times.
+    #[arg(long = "smart-device", value_parser = parse_smart_device)]
+    smart_devices: Vec<SmartDeviceConfig>,
 }
 
 fn main() -> Result<()> {
@@ -41,7 +50,7 @@ fn main() -> Result<()> {
     let mut decoder = FrameDecoder::<MAX_FRAME_LEN>::new();
     let mut handler = EventHandler::new(SystemdShutdown, args.allow_shutdown);
     let mut input = [0_u8; 64];
-    let mut health = HealthCollector::default();
+    let mut health = configured_health(args.ups, args.smart_devices)?;
     let mut last_health_status = None;
     let mut port = None;
     let mut waiting_logged = false;
@@ -138,6 +147,34 @@ fn main() -> Result<()> {
     }
 }
 
+fn configured_health(
+    ups: Option<String>,
+    smart_devices: Vec<SmartDeviceConfig>,
+) -> Result<HealthCollector> {
+    if smart_devices.len() > MAX_SMART_DEVICES {
+        anyhow::bail!("at most {MAX_SMART_DEVICES} --smart-device values are supported");
+    }
+    Ok(HealthCollector::new(ups, smart_devices))
+}
+
+fn parse_smart_device(value: &str) -> Result<SmartDeviceConfig, String> {
+    let (label, path) = value
+        .split_once('=')
+        .ok_or_else(|| "expected LABEL=/dev/path".to_owned())?;
+    if label.is_empty() || label.len() > MAX_SMART_LABEL_LEN || !label.is_ascii() {
+        return Err(format!(
+            "SMART label must be 1-{MAX_SMART_LABEL_LEN} ASCII characters"
+        ));
+    }
+    if !path.starts_with("/dev/") {
+        return Err("SMART device path must start with /dev/".to_owned());
+    }
+    Ok(SmartDeviceConfig {
+        label: label.to_ascii_uppercase(),
+        path: path.to_owned(),
+    })
+}
+
 fn current_unix_seconds() -> Result<u64> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -198,5 +235,14 @@ mod tests {
             changed_health_status(Some(HealthStatus::Healthy), HealthStatus::Healthy),
             None
         );
+    }
+
+    #[test]
+    fn parses_named_smart_devices() {
+        let device = parse_smart_device("backup=/dev/sdc").unwrap();
+        assert_eq!(device.label, "BACKUP");
+        assert_eq!(device.path, "/dev/sdc");
+        assert!(parse_smart_device("TOO-LONG=/dev/sda").is_err());
+        assert!(parse_smart_device("ROOT=sda").is_err());
     }
 }

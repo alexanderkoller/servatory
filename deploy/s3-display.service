@@ -7,7 +7,7 @@ After=pve-cluster.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/s3-display-host --device /dev/m5stick-s3 --allow-shutdown
+ExecStart=/usr/local/bin/s3-display-host --device /dev/m5stick-s3 --allow-shutdown --ups eaton@localhost --smart-device ROOT=/dev/sda --smart-device HDD=/dev/sdb --smart-device BACKUP=/dev/sdc --smart-device SDD=/dev/sdd --smart-device SDE=/dev/sde
 Restart=on-failure
 RestartSec=2s
 NoNewPrivileges=true

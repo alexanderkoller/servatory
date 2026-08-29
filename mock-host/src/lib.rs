@@ -3,7 +3,8 @@ use std::{io::Write, thread, time::Duration};
 use s3_display_host::Shutdown;
 use s3_display_protocol::{
     BackupJobStatus, FilesystemUsage, GuestKind, GuestSnapshot, GuestStatus, GuestSummary,
-    HealthSnapshot, InternetStatus,
+    HealthSnapshot, InternetStatus, SmartDeviceSummary, SmartSnapshot, SmartStatus, UpsSnapshot,
+    UpsStatus,
 };
 
 pub struct ConsoleShutdown<W> {
@@ -137,8 +138,28 @@ pub fn made_up_health() -> HealthSnapshot {
         Some(0),
         [10, 0, 0, 12],
         made_up_guests(),
+        UpsSnapshot {
+            status: UpsStatus::Online,
+            battery_percent: Some(100),
+            load_percent: Some(15),
+            runtime_seconds: Some(2_160),
+            estimated_watts: Some(102),
+            stale: false,
+        },
+        SmartSnapshot::from_slice(&[
+            smart("ROOT", SmartStatus::Healthy, Some(38)),
+            smart("HDD", SmartStatus::Healthy, Some(31)),
+            smart("BACKUP", SmartStatus::Healthy, Some(30)),
+            smart("SDD", SmartStatus::Healthy, Some(34)),
+            smart("SDE", SmartStatus::Sleeping, None),
+        ]),
     )
     .expect("built-in mock host name fits the protocol")
+}
+
+fn smart(label: &str, status: SmartStatus, temperature_celsius: Option<i8>) -> SmartDeviceSummary {
+    SmartDeviceSummary::new(label, status, temperature_celsius)
+        .expect("built-in SMART labels fit the protocol")
 }
 
 fn guest(
@@ -195,6 +216,8 @@ mod tests {
         assert_eq!(health.internet_status, InternetStatus::Reachable);
         assert_eq!(health.backup_job_status, BackupJobStatus::Healthy);
         assert_eq!(health.last_successful_backup_age_seconds, Some(21_600));
+        assert_eq!(health.ups.estimated_watts, Some(102));
+        assert_eq!(health.smart.devices().len(), 5);
         assert_eq!(health.guests.guests().len(), 5);
     }
 

@@ -10,7 +10,8 @@ use std::{
 
 use s3_display_protocol::{
     BackupJobStatus, FilesystemUsage, GuestKind, GuestSnapshot, GuestStatus, GuestSummary,
-    HealthSnapshot, InternetStatus, MAX_GUEST_NAME_LEN, MAX_HOST_NAME_LEN,
+    HealthSnapshot, InternetStatus, MAX_GUEST_NAME_LEN, MAX_HOST_NAME_LEN, SmartDeviceSummary,
+    SmartSnapshot, SmartStatus, UpsSnapshot, UpsStatus,
 };
 use serde_json::Value;
 
@@ -23,13 +24,30 @@ struct CpuTimes {
 pub struct HealthCollector {
     previous_cpu: Option<CpuTimes>,
     connectivity: ConnectivityProbe,
+    ups: UpsCollector,
+    smart_devices: Vec<SmartDeviceConfig>,
 }
 
 impl Default for HealthCollector {
     fn default() -> Self {
+        Self::new(None, Vec::new())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SmartDeviceConfig {
+    pub label: String,
+    pub path: String,
+}
+
+impl HealthCollector {
+    #[must_use]
+    pub fn new(ups_target: Option<String>, smart_devices: Vec<SmartDeviceConfig>) -> Self {
         Self {
             previous_cpu: None,
             connectivity: ConnectivityProbe::new(),
+            ups: UpsCollector::new(ups_target),
+            smart_devices,
         }
     }
 }
@@ -56,6 +74,8 @@ impl HealthCollector {
                 .ok()
                 .map(|duration| duration.as_secs()),
         );
+        let ups = self.ups.collect();
+        let smart = read_smart(&self.smart_devices);
         HealthSnapshot::new(
             &host_name,
             read_uptime(),
@@ -76,9 +96,182 @@ impl HealthCollector {
             last_internet_success_age_seconds,
             network.ipv4,
             read_guests(&host_name),
+            ups,
+            smart,
         )
         .expect("collector truncates host names to the protocol limit")
     }
+}
+
+const UPS_FAILURES_BEFORE_UNAVAILABLE: u8 = 2;
+
+struct UpsCollector {
+    target: Option<String>,
+    last_good: Option<UpsSnapshot>,
+    consecutive_failures: u8,
+}
+
+impl UpsCollector {
+    fn new(target: Option<String>) -> Self {
+        Self {
+            target,
+            last_good: None,
+            consecutive_failures: 0,
+        }
+    }
+
+    fn collect(&mut self) -> UpsSnapshot {
+        let Some(target) = self.target.as_deref() else {
+            return UpsSnapshot::NOT_CONFIGURED;
+        };
+        let snapshot = ["/usr/bin/upsc", "/usr/sbin/upsc"]
+            .iter()
+            .find_map(|executable| {
+                let output = Command::new(executable).arg(target).output().ok()?;
+                output
+                    .status
+                    .success()
+                    .then(|| parse_upsc(&String::from_utf8_lossy(&output.stdout)))?
+            });
+        if let Some(snapshot) = snapshot {
+            self.consecutive_failures = 0;
+            self.last_good = Some(snapshot);
+            return snapshot;
+        }
+
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        let mut stale = self.last_good.unwrap_or(UpsSnapshot {
+            status: UpsStatus::Unknown,
+            battery_percent: None,
+            load_percent: None,
+            runtime_seconds: None,
+            estimated_watts: None,
+            stale: true,
+        });
+        stale.stale = true;
+        if self.consecutive_failures >= UPS_FAILURES_BEFORE_UNAVAILABLE {
+            stale.status = UpsStatus::Unavailable;
+        }
+        stale
+    }
+}
+
+fn parse_upsc(output: &str) -> Option<UpsSnapshot> {
+    let value = |key: &str| {
+        output.lines().find_map(|line| {
+            let (candidate, value) = line.split_once(':')?;
+            (candidate.trim() == key).then(|| value.trim())
+        })
+    };
+    let flags = value("ups.status")?;
+    let has = |flag: &str| flags.split_whitespace().any(|candidate| candidate == flag);
+    let status = if has("LB") {
+        UpsStatus::LowBattery
+    } else if has("RB") {
+        UpsStatus::ReplaceBattery
+    } else if has("OFF") {
+        UpsStatus::OutputOff
+    } else if has("OB") {
+        UpsStatus::OnBattery
+    } else if has("BYPASS") {
+        UpsStatus::Bypass
+    } else if has("CHRG") {
+        UpsStatus::Charging
+    } else if has("OL") {
+        UpsStatus::Online
+    } else {
+        UpsStatus::Unknown
+    };
+    Some(UpsSnapshot {
+        status,
+        battery_percent: value("battery.charge").and_then(parse_percent_u8),
+        load_percent: value("ups.load").and_then(parse_percent_u8),
+        runtime_seconds: value("battery.runtime").and_then(|value| value.parse().ok()),
+        estimated_watts: value("ups.realpower")
+            .and_then(|value| value.parse::<f64>().ok())
+            .map(bounded_u16),
+        stale: false,
+    })
+}
+
+fn parse_percent_u8(value: &str) -> Option<u8> {
+    value.parse::<f64>().ok().map(percent)
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn bounded_u16(value: f64) -> u16 {
+    value.clamp(0.0, f64::from(u16::MAX)).round() as u16
+}
+
+fn read_smart(devices: &[SmartDeviceConfig]) -> SmartSnapshot {
+    let summaries: Vec<_> = devices
+        .iter()
+        .filter_map(|device| {
+            let (status, temperature) = read_smart_device(&device.path);
+            SmartDeviceSummary::new(&device.label, status, temperature).ok()
+        })
+        .collect();
+    SmartSnapshot::from_slice(&summaries)
+}
+
+fn read_smart_device(path: &str) -> (SmartStatus, Option<i8>) {
+    let output = ["/usr/sbin/smartctl", "/usr/bin/smartctl"]
+        .iter()
+        .find_map(|executable| {
+            Command::new(executable)
+                .args(["-j", "-n", "standby", "-H", "-A", "-d", "sat", path])
+                .output()
+                .ok()
+        });
+    let Some(output) = output else {
+        return (SmartStatus::Unknown, None);
+    };
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if output.status.code() == Some(2) && combined.to_ascii_uppercase().contains("STANDBY") {
+        return (SmartStatus::Sleeping, None);
+    }
+
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+    let temperature = smart_temperature(&json);
+    let exit = output.status.code().unwrap_or(1);
+    let passed = json
+        .pointer("/smart_status/passed")
+        .and_then(Value::as_bool);
+    let status = if passed == Some(false) || exit & (1 << 3) != 0 {
+        SmartStatus::Failed
+    } else if exit & ((1 << 4) | (1 << 5)) != 0
+        || temperature.is_some_and(|temperature| temperature >= 55)
+    {
+        SmartStatus::Warning
+    } else if passed == Some(true) || output.status.success() {
+        SmartStatus::Healthy
+    } else {
+        SmartStatus::Unknown
+    };
+    (status, temperature)
+}
+
+fn smart_temperature(json: &Value) -> Option<i8> {
+    json.pointer("/temperature/current")
+        .and_then(Value::as_i64)
+        .or_else(|| {
+            json.pointer("/ata_smart_attributes/table")?
+                .as_array()?
+                .iter()
+                .find(|attribute| {
+                    matches!(
+                        attribute.get("name").and_then(Value::as_str),
+                        Some("Temperature_Celsius" | "Airflow_Temperature_Cel")
+                    )
+                })?
+                .pointer("/raw/value")
+                .and_then(Value::as_i64)
+        })
+        .and_then(|temperature| i8::try_from(temperature).ok())
 }
 
 fn read_host_name() -> String {
@@ -775,6 +968,43 @@ mod tests {
             "/mnt/pve/backup",
         )
         .is_none());
+    }
+
+    #[test]
+    fn parses_read_only_nut_status_and_estimated_power() {
+        let snapshot = parse_upsc(
+            "battery.charge: 100\nbattery.runtime: 2160\nups.load: 15\nups.realpower: 102\nups.status: OL\n",
+        )
+        .unwrap();
+        assert_eq!(snapshot.status, UpsStatus::Online);
+        assert_eq!(snapshot.battery_percent, Some(100));
+        assert_eq!(snapshot.load_percent, Some(15));
+        assert_eq!(snapshot.runtime_seconds, Some(2_160));
+        assert_eq!(snapshot.estimated_watts, Some(102));
+        assert!(!snapshot.stale);
+    }
+
+    #[test]
+    fn nut_status_uses_the_most_urgent_flag() {
+        assert_eq!(
+            parse_upsc("ups.status: OB LB DISCHRG\n").unwrap().status,
+            UpsStatus::LowBattery
+        );
+        assert_eq!(
+            parse_upsc("ups.status: OL RB\n").unwrap().status,
+            UpsStatus::ReplaceBattery
+        );
+    }
+
+    #[test]
+    fn parses_smart_temperature_from_json_variants() {
+        let direct: Value = serde_json::from_str(r#"{"temperature":{"current":31}}"#).unwrap();
+        assert_eq!(smart_temperature(&direct), Some(31));
+        let attribute: Value = serde_json::from_str(
+            r#"{"ata_smart_attributes":{"table":[{"name":"Temperature_Celsius","raw":{"value":38}}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(smart_temperature(&attribute), Some(38));
     }
 
     #[test]

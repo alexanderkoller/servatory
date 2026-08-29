@@ -4,13 +4,15 @@ use core::fmt;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-pub const PROTOCOL_VERSION: u8 = 3;
+pub const PROTOCOL_VERSION: u8 = 4;
 /// Maximum COBS-encoded frame size, including its trailing zero delimiter.
 pub const MAX_FRAME_LEN: usize = 512;
 pub const MAX_GUESTS: usize = 8;
 pub const MAX_GUEST_NAME_LEN: usize = 20;
 pub const MAX_HOST_NAME_LEN: usize = 20;
 pub const MAX_NETWORK_INTERFACE_LEN: usize = 15;
+pub const MAX_SMART_DEVICES: usize = 5;
+pub const MAX_SMART_LABEL_LEN: usize = 6;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[repr(transparent)]
@@ -85,6 +87,134 @@ pub enum BackupJobStatus {
     Running,
     Failed,
     Stale,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum UpsStatus {
+    NotConfigured,
+    Unknown,
+    Online,
+    OnBattery,
+    LowBattery,
+    Charging,
+    Bypass,
+    OutputOff,
+    ReplaceBattery,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct UpsSnapshot {
+    pub status: UpsStatus,
+    pub battery_percent: Option<u8>,
+    pub load_percent: Option<u8>,
+    pub runtime_seconds: Option<u32>,
+    pub estimated_watts: Option<u16>,
+    pub stale: bool,
+}
+
+impl UpsSnapshot {
+    pub const NOT_CONFIGURED: Self = Self {
+        status: UpsStatus::NotConfigured,
+        battery_percent: None,
+        load_percent: None,
+        runtime_seconds: None,
+        estimated_watts: None,
+        stale: false,
+    };
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum SmartStatus {
+    Healthy,
+    Warning,
+    Failed,
+    Sleeping,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SmartDeviceSummary {
+    pub status: SmartStatus,
+    pub temperature_celsius: Option<i8>,
+    label_len: u8,
+    label: [u8; MAX_SMART_LABEL_LEN],
+}
+
+impl SmartDeviceSummary {
+    pub const EMPTY: Self = Self {
+        status: SmartStatus::Unknown,
+        temperature_celsius: None,
+        label_len: 0,
+        label: [0; MAX_SMART_LABEL_LEN],
+    };
+
+    /// Creates one bounded SMART device row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SmartLabelError::TooLong`] when the label exceeds the wire limit.
+    pub fn new(
+        label: &str,
+        status: SmartStatus,
+        temperature_celsius: Option<i8>,
+    ) -> Result<Self, SmartLabelError> {
+        if label.len() > MAX_SMART_LABEL_LEN {
+            return Err(SmartLabelError::TooLong);
+        }
+        let mut bytes = [0; MAX_SMART_LABEL_LEN];
+        bytes[..label.len()].copy_from_slice(label.as_bytes());
+        Ok(Self {
+            status,
+            temperature_celsius,
+            label_len: u8::try_from(label.len()).unwrap_or(0),
+            label: bytes,
+        })
+    }
+
+    #[must_use]
+    pub fn label(&self) -> &str {
+        let len = usize::from(self.label_len).min(MAX_SMART_LABEL_LEN);
+        core::str::from_utf8(&self.label[..len]).unwrap_or("?")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SmartLabelError {
+    TooLong,
+}
+
+impl fmt::Display for SmartLabelError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SMART label exceeds {MAX_SMART_LABEL_LEN} bytes")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SmartSnapshot {
+    len: u8,
+    devices: [SmartDeviceSummary; MAX_SMART_DEVICES],
+}
+
+impl SmartSnapshot {
+    pub const EMPTY: Self = Self {
+        len: 0,
+        devices: [SmartDeviceSummary::EMPTY; MAX_SMART_DEVICES],
+    };
+
+    #[must_use]
+    pub fn from_slice(devices: &[SmartDeviceSummary]) -> Self {
+        let len = devices.len().min(MAX_SMART_DEVICES);
+        let mut snapshot = Self::EMPTY;
+        snapshot.devices[..len].copy_from_slice(&devices[..len]);
+        snapshot.len = u8::try_from(len).unwrap_or(0);
+        snapshot
+    }
+
+    #[must_use]
+    pub fn devices(&self) -> &[SmartDeviceSummary] {
+        &self.devices[..usize::from(self.len).min(MAX_SMART_DEVICES)]
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -250,6 +380,8 @@ pub struct HealthSnapshot {
     pub last_internet_success_age_seconds: Option<u32>,
     pub ipv4: [u8; 4],
     pub guests: GuestSnapshot,
+    pub ups: UpsSnapshot,
+    pub smart: SmartSnapshot,
     host_name_len: u8,
     host_name: [u8; MAX_HOST_NAME_LEN],
     network_interface_len: u8,
@@ -265,6 +397,10 @@ pub enum HealthStatus {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WarningCause {
+    UpsOnBattery,
+    UpsBypass,
+    UpsUnavailable,
+    SmartWarning,
     Cpu(u8),
     Memory(u8),
     IoPressure(u8),
@@ -275,6 +411,10 @@ pub enum WarningCause {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CriticalCause {
+    UpsLowBattery,
+    UpsOutputOff,
+    UpsReplaceBattery,
+    SmartFailed,
     LinkDown,
     PingFailed,
     RootStorage(FilesystemUsage),
@@ -346,6 +486,10 @@ impl fmt::Display for HealthCause {
 impl fmt::Display for WarningCause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UpsOnBattery => f.write_str("UPS ON BATTERY"),
+            Self::UpsBypass => f.write_str("UPS BYPASS"),
+            Self::UpsUnavailable => f.write_str("UPS UNAVAILABLE"),
+            Self::SmartWarning => f.write_str("SMART WARNING"),
             Self::Cpu(percent) => write!(f, "CPU {percent}%"),
             Self::Memory(percent) => write!(f, "MEMORY {percent}%"),
             Self::IoPressure(percent) => write!(f, "IO PRESS {percent}%"),
@@ -359,6 +503,10 @@ impl fmt::Display for WarningCause {
 impl fmt::Display for CriticalCause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UpsLowBattery => f.write_str("UPS LOW BATTERY"),
+            Self::UpsOutputOff => f.write_str("UPS OUTPUT OFF"),
+            Self::UpsReplaceBattery => f.write_str("UPS REPLACE BAT"),
+            Self::SmartFailed => f.write_str("SMART FAILED"),
             Self::LinkDown => f.write_str("LINK DOWN"),
             Self::PingFailed => f.write_str("PING FAILED"),
             Self::RootStorage(usage) => write_storage_cause(f, "ROOT", *usage),
@@ -408,6 +556,8 @@ impl HealthSnapshot {
         last_internet_success_age_seconds: Option<u32>,
         ipv4: [u8; 4],
         guests: GuestSnapshot,
+        ups: UpsSnapshot,
+        smart: SmartSnapshot,
     ) -> Result<Self, HealthSnapshotError> {
         if host_name.len() > MAX_HOST_NAME_LEN {
             return Err(HealthSnapshotError::HostNameTooLong);
@@ -437,6 +587,8 @@ impl HealthSnapshot {
             last_internet_success_age_seconds,
             ipv4,
             guests,
+            ups,
+            smart,
             host_name_len: u8::try_from(host_name.len()).unwrap_or(0),
             host_name: bytes,
             network_interface_len: u8::try_from(network_interface.len()).unwrap_or(0),
@@ -458,7 +610,20 @@ impl HealthSnapshot {
 
     #[must_use]
     pub fn health_status(&self) -> HealthStatus {
-        if !self.network_up {
+        if self.ups.status == UpsStatus::LowBattery {
+            return HealthStatus::Critical(CriticalCause::UpsLowBattery);
+        } else if self.ups.status == UpsStatus::OutputOff {
+            return HealthStatus::Critical(CriticalCause::UpsOutputOff);
+        } else if self.ups.status == UpsStatus::ReplaceBattery {
+            return HealthStatus::Critical(CriticalCause::UpsReplaceBattery);
+        } else if self
+            .smart
+            .devices()
+            .iter()
+            .any(|device| device.status == SmartStatus::Failed)
+        {
+            return HealthStatus::Critical(CriticalCause::SmartFailed);
+        } else if !self.network_up {
             return HealthStatus::Critical(CriticalCause::LinkDown);
         } else if self.internet_status == InternetStatus::Failed {
             return HealthStatus::Critical(CriticalCause::PingFailed);
@@ -473,7 +638,22 @@ impl HealthSnapshot {
         }
 
         let memory = memory_percent(self);
-        if self.cpu_percent >= 85 {
+        if self.ups.status == UpsStatus::OnBattery {
+            HealthStatus::Warning(WarningCause::UpsOnBattery)
+        } else if self.ups.status == UpsStatus::Bypass {
+            HealthStatus::Warning(WarningCause::UpsBypass)
+        } else if self.ups.status == UpsStatus::Unavailable
+            || (self.ups.status == UpsStatus::Unknown && !self.ups.stale)
+        {
+            HealthStatus::Warning(WarningCause::UpsUnavailable)
+        } else if self
+            .smart
+            .devices()
+            .iter()
+            .any(|device| matches!(device.status, SmartStatus::Warning | SmartStatus::Unknown))
+        {
+            HealthStatus::Warning(WarningCause::SmartWarning)
+        } else if self.cpu_percent >= 85 {
             HealthStatus::Warning(WarningCause::Cpu(self.cpu_percent))
         } else if memory >= 90 {
             HealthStatus::Warning(WarningCause::Memory(memory))
@@ -747,6 +927,8 @@ mod tests {
             Some(0),
             [10, 0, 0, 12],
             GuestSnapshot::EMPTY,
+            UpsSnapshot::NOT_CONFIGURED,
+            SmartSnapshot::EMPTY,
         )
         .unwrap()
     }
@@ -774,6 +956,40 @@ mod tests {
         assert_eq!(
             critical.cause(),
             Some(HealthCause::Critical(CriticalCause::LinkDown))
+        );
+    }
+
+    #[test]
+    fn ups_and_smart_conditions_affect_overall_health() {
+        let mut snapshot = healthy_snapshot();
+        snapshot.ups = UpsSnapshot {
+            status: UpsStatus::OnBattery,
+            battery_percent: Some(80),
+            load_percent: Some(15),
+            runtime_seconds: Some(1_800),
+            estimated_watts: Some(102),
+            stale: false,
+        };
+        assert_eq!(
+            snapshot.health_status(),
+            HealthStatus::Warning(WarningCause::UpsOnBattery)
+        );
+
+        snapshot.smart = SmartSnapshot::from_slice(&[SmartDeviceSummary::new(
+            "HDD",
+            SmartStatus::Failed,
+            Some(31),
+        )
+        .unwrap()]);
+        assert_eq!(
+            snapshot.health_status(),
+            HealthStatus::Critical(CriticalCause::SmartFailed)
+        );
+
+        snapshot.ups.status = UpsStatus::LowBattery;
+        assert_eq!(
+            snapshot.health_status(),
+            HealthStatus::Critical(CriticalCause::UpsLowBattery)
         );
     }
 
@@ -841,6 +1057,8 @@ mod tests {
                     Some(0),
                     [10, 0, 0, 12],
                     GuestSnapshot::from_slice(&[guest]),
+                    UpsSnapshot::NOT_CONFIGURED,
+                    SmartSnapshot::EMPTY,
                 )
                 .unwrap(),
             },
@@ -983,6 +1201,8 @@ mod tests {
                 None,
                 [0; 4],
                 GuestSnapshot::EMPTY,
+                UpsSnapshot::NOT_CONFIGURED,
+                SmartSnapshot::EMPTY,
             ),
             Err(HealthSnapshotError::NetworkInterfaceTooLong)
         );
@@ -1045,6 +1265,22 @@ mod tests {
             Some(u32::MAX),
             [255; 4],
             GuestSnapshot::from_slice(&[guest; MAX_GUESTS]),
+            UpsSnapshot {
+                status: UpsStatus::ReplaceBattery,
+                battery_percent: Some(100),
+                load_percent: Some(100),
+                runtime_seconds: Some(u32::MAX),
+                estimated_watts: Some(u16::MAX),
+                stale: true,
+            },
+            SmartSnapshot::from_slice(
+                &[SmartDeviceSummary {
+                    status: SmartStatus::Failed,
+                    temperature_celsius: Some(i8::MAX),
+                    label_len: u8::try_from(MAX_SMART_LABEL_LEN).unwrap(),
+                    label: [b'X'; MAX_SMART_LABEL_LEN],
+                }; MAX_SMART_DEVICES],
+            ),
         )
         .unwrap();
         let mut storage = [0; MAX_FRAME_LEN];
