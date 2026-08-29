@@ -7,8 +7,8 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use health_stick_host::{EventHandler, SystemdShutdown, write_host_message};
-use health_stick_protocol::{
+use servatory_host::{EventHandler, SystemdShutdown, write_host_message};
+use servatory_protocol::{
     DeviceMessage, FrameDecoder, HealthLevel, HealthReport, HostMessage, MAX_FRAME_LEN,
     PROTOCOL_VERSION, ProtocolError, Sequence, SoftwareVersion, UnixSeconds, decode_device,
 };
@@ -109,7 +109,7 @@ fn main() -> Result<()> {
         if !handshake_established && Instant::now() >= next_hello {
             if let Err(error) = write_host_message(
                 HostMessage::Hello {
-                    daemon_version: SoftwareVersion::new(env!("HEALTH_STICK_BUILD_VERSION")),
+                    daemon_version: SoftwareVersion::new(env!("SERVATORY_BUILD_VERSION")),
                 },
                 connected_port,
             ) {

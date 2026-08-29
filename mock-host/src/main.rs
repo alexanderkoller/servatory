@@ -6,12 +6,12 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
-use health_stick_host::{EventHandler, write_host_message};
-use health_stick_mock_host::{ConsoleShutdown, made_up_health};
-use health_stick_protocol::{
+use serialport::{SerialPortInfo, SerialPortType};
+use servatory_host::{EventHandler, write_host_message};
+use servatory_mock_host::{ConsoleShutdown, made_up_health};
+use servatory_protocol::{
     FrameDecoder, HostMessage, MAX_FRAME_LEN, Sequence, UnixSeconds, decode_device,
 };
-use serialport::{SerialPortInfo, SerialPortType};
 
 const ESPRESSIF_VID: u16 = 0x303a;
 const USB_SERIAL_JTAG_PID: u16 = 0x1001;

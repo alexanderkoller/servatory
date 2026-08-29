@@ -6,15 +6,15 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use health_stick_protocol::{
+use serde::{Deserialize, Deserializer};
+use serde_yaml::Value;
+use servatory_protocol::{
     BackupJobStatus, DisplayConfig, DisplayLabel, DisplayPage, DisplayView, HealthLevel,
     HealthReport, HealthSnapshot, HostMessage, MAX_FRAME_LEN, SmartStatus, SoftwareVersion,
     UpsStatus, encode_host,
 };
-use serde::{Deserialize, Deserializer};
-use serde_yaml::Value;
 
-pub const DEFAULT_CONFIG_PATH: &str = "/etc/health-stick/config.yaml";
+pub const DEFAULT_CONFIG_PATH: &str = "/etc/servatory/config.yaml";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -370,7 +370,7 @@ impl Config {
             .context("shutdown animation_delay exceeds device limit")?;
         let mut display = DisplayConfig::new(hold, delay, labels, self.compile_pages(guest_count)?)
             .map_err(|error| anyhow::anyhow!("invalid display configuration: {error}"))?;
-        display.daemon_version = SoftwareVersion::new(env!("HEALTH_STICK_BUILD_VERSION"));
+        display.daemon_version = SoftwareVersion::new(env!("SERVATORY_BUILD_VERSION"));
         Ok(display)
     }
 
@@ -842,12 +842,12 @@ fn smart_status(value: SmartStatus) -> &'static str {
         SmartStatus::Unknown => "unknown",
     }
 }
-fn internet_status(value: health_stick_protocol::InternetStatus) -> &'static str {
+fn internet_status(value: servatory_protocol::InternetStatus) -> &'static str {
     match value {
-        health_stick_protocol::InternetStatus::Checking => "checking",
-        health_stick_protocol::InternetStatus::Reachable => "reachable",
-        health_stick_protocol::InternetStatus::Missed => "missed",
-        health_stick_protocol::InternetStatus::Failed => "failed",
+        servatory_protocol::InternetStatus::Checking => "checking",
+        servatory_protocol::InternetStatus::Reachable => "reachable",
+        servatory_protocol::InternetStatus::Missed => "missed",
+        servatory_protocol::InternetStatus::Failed => "failed",
     }
 }
 fn backup_status(value: BackupJobStatus) -> &'static str {
@@ -890,14 +890,14 @@ fn parse_duration(value: &str) -> std::result::Result<Duration, String> {
 
 #[cfg(test)]
 mod tests {
-    use health_stick_protocol::{
+    use servatory_protocol::{
         BackupJobStatus, FilesystemUsage, GuestSnapshot, InternetStatus, SmartSnapshot, UpsSnapshot,
     };
 
     use super::*;
 
     fn current_config() -> Config {
-        let config: Config = serde_yaml::from_str(include_str!("../../deploy/health-stick.yaml"))
+        let config: Config = serde_yaml::from_str(include_str!("../../deploy/servatory.yaml"))
             .expect("deployed configuration parses");
         config.validate().expect("deployed configuration validates");
         config
@@ -941,7 +941,7 @@ mod tests {
 
     #[test]
     fn animation_delay_may_be_below_two_hundred_milliseconds() {
-        let yaml = include_str!("../../deploy/health-stick.yaml")
+        let yaml = include_str!("../../deploy/servatory.yaml")
             .replace("animation_delay: 200ms", "animation_delay: 1ms");
         let config: Config = serde_yaml::from_str(&yaml).unwrap();
         config.validate().unwrap();
@@ -964,7 +964,7 @@ mod tests {
 
     #[test]
     fn two_column_panels_can_be_swapped() {
-        let yaml = include_str!("../../deploy/health-stick.yaml").replace(
+        let yaml = include_str!("../../deploy/servatory.yaml").replace(
             "columns: { left: ups, right: network }",
             "columns: { left: network, right: ups }",
         );

@@ -8,12 +8,12 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use health_stick_protocol::{
+use serde_json::Value;
+use servatory_protocol::{
     BackupJobStatus, FilesystemUsage, GuestKind, GuestSnapshot, GuestStatus, GuestSummary,
     HealthSnapshot, InternetStatus, SmartDeviceSummary, SmartSnapshot, SmartStatus, UpsSnapshot,
     UpsStatus,
 };
-use serde_json::Value;
 
 use crate::config::{InternetConfig, SmartDeviceConfig};
 
@@ -980,7 +980,7 @@ mod tests {
     impl TempSysfs {
         fn new() -> Self {
             let path = std::env::temp_dir().join(format!(
-                "health-stick-sysfs-{}-{}",
+                "servatory-sysfs-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)

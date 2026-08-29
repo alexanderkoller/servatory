@@ -1,5 +1,5 @@
 [package]
-name = "health-stick-protocol"
+name = "servatory-protocol"
 description = "Versioned wire protocol for the M5Stick S3 server display"
 edition.workspace = true
 license.workspace = true

@@ -30,18 +30,18 @@ use esp_hal::{
     time::{Duration, Instant, Rate},
     usb_serial_jtag::UsbSerialJtag,
 };
-use health_stick_protocol::{
-    BackupJobStatus, ButtonAction, DeviceMessage, DisplayConfig, DisplayPage, FilesystemUsage,
-    FrameDecoder, GuestKind, GuestStatus, HealthLevel, HealthSnapshot, HostMessage, InternetStatus,
-    MAX_FRAME_LEN, PROTOCOL_VERSION, ProtocolError, ShutdownFailure, ShutdownPhase,
-    SmartDeviceSummary, SmartStatus, SoftwareVersion, UpsStatus, decode_host, encode_device,
-};
 use heapless::{Deque, String};
 use mipidsi::{
     Builder,
     interface::SpiInterface,
     models::ST7789,
     options::{ColorInversion, Orientation, Rotation},
+};
+use servatory_protocol::{
+    BackupJobStatus, ButtonAction, DeviceMessage, DisplayConfig, DisplayPage, FilesystemUsage,
+    FrameDecoder, GuestKind, GuestStatus, HealthLevel, HealthSnapshot, HostMessage, InternetStatus,
+    MAX_FRAME_LEN, PROTOCOL_VERSION, ProtocolError, ShutdownFailure, ShutdownPhase,
+    SmartDeviceSummary, SmartStatus, SoftwareVersion, UpsStatus, decode_host, encode_device,
 };
 use static_cell::StaticCell;
 
@@ -187,7 +187,7 @@ impl UsbTx {
 
 fn device_hello() -> DeviceMessage {
     DeviceMessage::Hello {
-        firmware_version: SoftwareVersion::new(env!("HEALTH_STICK_BUILD_VERSION")),
+        firmware_version: SoftwareVersion::new(env!("SERVATORY_BUILD_VERSION")),
     }
 }
 
@@ -2096,7 +2096,7 @@ where
         .ok();
 
     let mut firmware = String::<40>::new();
-    let _ = write!(firmware, "FIRMWARE  {}", env!("HEALTH_STICK_BUILD_VERSION"));
+    let _ = write!(firmware, "FIRMWARE  {}", env!("SERVATORY_BUILD_VERSION"));
     Text::new(&firmware, Point::new(18, 58), body)
         .draw(display)
         .ok();

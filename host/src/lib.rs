@@ -1,10 +1,10 @@
 use std::{fs, io::Write, process::Command, thread, time::Duration};
 
-use health_stick_protocol::{
+use serde_json::Value;
+use servatory_protocol::{
     ButtonAction, DeviceMessage, HostMessage, MAX_FRAME_LEN, ShutdownFailure, ShutdownPhase,
     encode_host,
 };
-use serde_json::Value;
 
 const SHUTDOWN_FAILURE_DISPLAY_TIME: Duration = Duration::from_secs(3);
 
@@ -298,7 +298,7 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(
-            health_stick_protocol::decode_host(&mut output),
+            servatory_protocol::decode_host(&mut output),
             Ok(HostMessage::ShutdownAccepted)
         );
         assert_eq!(handler.shutdown.calls, 1);

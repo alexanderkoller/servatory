@@ -1,5 +1,5 @@
 [package]
-name = "health-stick-host"
+name = "servatory-host"
 build = "build.rs"
 description = "Linux-side USB updater for the M5Stick S3 server display"
 edition.workspace = true
@@ -13,7 +13,7 @@ serialport = { version = "4.8.1", default-features = false }
 serde_json = "1.0.149"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_yaml = "0.9.34"
-health-stick-protocol = { path = "../protocol" }
+servatory-protocol = { path = "../protocol" }
 
 [lints]
 workspace = true

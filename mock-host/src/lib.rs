@@ -1,7 +1,7 @@
 use std::{io::Write, thread, time::Duration};
 
-use health_stick_host::Shutdown;
-use health_stick_protocol::{
+use servatory_host::Shutdown;
+use servatory_protocol::{
     BackupJobStatus, FilesystemUsage, GuestKind, GuestSnapshot, GuestStatus, GuestSummary,
     HealthSnapshot, InternetStatus, SmartDeviceSummary, SmartSnapshot, SmartStatus, UpsSnapshot,
     UpsStatus,
@@ -27,8 +27,8 @@ impl<W> ConsoleShutdown<W> {
 
 impl<W: Write> Shutdown for ConsoleShutdown<W> {
     fn poweroff(&mut self, output: &mut impl Write) -> anyhow::Result<()> {
-        use health_stick_host::write_host_message;
-        use health_stick_protocol::{HostMessage, ShutdownPhase};
+        use servatory_host::write_host_message;
+        use servatory_protocol::{HostMessage, ShutdownPhase};
 
         for (phase, remaining) in [
             (ShutdownPhase::PreparingGuests, 4),

@@ -1,16 +1,16 @@
-# health-stick configuration reference
+# Servatory configuration reference
 
-The health-stick daemon reads one YAML document at startup. The default path is
-`/etc/health-stick/config.yaml`; use `--config PATH` to select another file.
+The Servatory daemon reads one YAML document at startup. The default path is
+`/etc/servatory/config.yaml`; use `--config PATH` to select another file.
 Configuration changes take effect only after the daemon restarts.
 
-Start with the supplied [`deploy/health-stick.yaml`](../deploy/health-stick.yaml)
+Start with the supplied [`deploy/servatory.yaml`](../deploy/servatory.yaml)
 and change the resources and rules that differ on your server. Before restarting
 the service, validate the result:
 
 ```sh
-sudo /usr/local/bin/health-stick-host \
-  --config /etc/health-stick/config.yaml \
+sudo /usr/local/bin/servatory-host \
+  --config /etc/servatory/config.yaml \
   --check-config
 ```
 
@@ -49,13 +49,13 @@ host:
 
 connection:
   usb_serial:
-    device: /dev/health-stick
+    device: /dev/servatory
     reconnect_interval: 1s
 ```
 
 `host.update_interval` controls how often the daemon collects and sends a full
 health update. `connection.usb_serial.device` is the serial device to open. The
-installed udev rule creates `/dev/health-stick`; use a platform-specific serial
+installed udev rule creates `/dev/servatory`; use a platform-specific serial
 path only when running without that rule. `reconnect_interval` controls how
 long the daemon waits after a failed connection attempt or disconnect.
 
@@ -132,7 +132,7 @@ sources:
 Each device has a stable `id`, a non-empty display `label`, and a `path` that
 starts with `/dev/`. SMART IDs follow the same character and uniqueness rules as
 filesystem IDs, but the two groups have separate namespaces. The list may be
-empty. health-stick uses `smartctl -n standby`, so collecting a status does not
+empty. Servatory uses `smartctl -n standby`, so collecting a status does not
 wake a sleeping disk.
 
 ### UPS

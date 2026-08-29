@@ -12,7 +12,7 @@ fn main() {
     } else {
         ""
     };
-    println!("cargo:rustc-env=HEALTH_STICK_BUILD_VERSION={package}+g{revision}{dirty}");
+    println!("cargo:rustc-env=SERVATORY_BUILD_VERSION={package}+g{revision}{dirty}");
 }
 
 fn git_is_dirty(repository: &Path) -> bool {

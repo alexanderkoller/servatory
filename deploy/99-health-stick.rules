@@ -1,2 +1,0 @@
-# ESP32-S3 USB Serial/JTAG (VID 303a, PID 1001). Add ATTRS{serial} for multiple boards.
-SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="1001", SYMLINK+="health-stick", TAG+="systemd", ENV{SYSTEMD_WANTS}+="health-stick.service"

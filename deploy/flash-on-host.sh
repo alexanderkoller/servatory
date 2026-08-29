@@ -4,14 +4,14 @@ set -euo pipefail
 
 flash_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 case "$flash_dir" in
-    /tmp/health-stick-flash.*) ;;
+    /tmp/servatory-flash.*) ;;
     *)
         echo "Refusing to run from unexpected directory: $flash_dir" >&2
         exit 1
         ;;
 esac
 
-service=health-stick.service
+service=servatory.service
 service_masked=false
 
 cleanup() {
@@ -21,7 +21,7 @@ cleanup() {
     if [[ "$service_masked" == true ]]; then
         sudo systemctl unmask --runtime "$service"
         sudo udevadm settle
-        if [[ -e /dev/health-stick ]]; then
+        if [[ -e /dev/servatory ]]; then
             sudo systemctl start "$service"
         fi
     fi
@@ -38,14 +38,14 @@ if ! command -v sudo >/dev/null 2>&1; then
     echo "The remote account needs sudo access to flash the Stick." >&2
     exit 1
 fi
-for required_file in health-stick-firmware espflash; do
+for required_file in servatory-firmware espflash; do
     if [[ ! -f "$flash_dir/$required_file" ]]; then
         echo "Missing uploaded file: $required_file" >&2
         exit 1
     fi
 done
-if [[ ! -e /dev/health-stick ]]; then
-    echo "The Health Stick device /dev/health-stick is missing." >&2
+if [[ ! -e /dev/servatory ]]; then
+    echo "The Servatory device /dev/servatory is missing." >&2
     exit 1
 fi
 
@@ -57,8 +57,8 @@ chmod 0755 "$flash_dir/espflash"
 # avoidable display downtime.
 "$flash_dir/espflash" save-image \
     --chip esp32s3 \
-    "$flash_dir/health-stick-firmware" \
-    "$flash_dir/health-stick-firmware.bin"
+    "$flash_dir/servatory-firmware" \
+    "$flash_dir/servatory-firmware.bin"
 
 echo "Temporarily stopping the display daemon..."
 sudo -v
@@ -71,10 +71,10 @@ fi
 echo "Flashing the M5Stick attached to this server..."
 sudo "$flash_dir/espflash" flash \
     --chip esp32s3 \
-    --port /dev/health-stick \
+    --port /dev/servatory \
     --non-interactive \
     --after watchdog-reset \
     --skip-update-check \
-    "$flash_dir/health-stick-firmware"
+    "$flash_dir/servatory-firmware"
 
 echo "Firmware flashed successfully; restoring the display daemon."

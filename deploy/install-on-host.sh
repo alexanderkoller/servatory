@@ -4,7 +4,7 @@ set -euo pipefail
 
 install_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 case "$install_dir" in
-    /tmp/health-stick-install.*) ;;
+    /tmp/servatory-install.*) ;;
     *)
         echo "Refusing to run from unexpected directory: $install_dir" >&2
         exit 1
@@ -26,15 +26,15 @@ if ! command -v sudo >/dev/null 2>&1; then
     exit 1
 fi
 
-for required_file in health-stick-host 99-health-stick.rules health-stick.service health-stick.yaml; do
+for required_file in servatory-host 99-servatory.rules servatory.service servatory.yaml; do
     if [[ ! -f "$install_dir/$required_file" ]]; then
         echo "Missing uploaded file: $required_file" >&2
         exit 1
     fi
 done
 
-chmod 0755 "$install_dir/health-stick-host"
-if ! "$install_dir/health-stick-host" --help >/dev/null; then
+chmod 0755 "$install_dir/servatory-host"
+if ! "$install_dir/servatory-host" --help >/dev/null; then
     echo "The uploaded daemon cannot run on this server." >&2
     exit 1
 fi
@@ -44,33 +44,43 @@ sudo -v
 privilege=(sudo)
 
 echo "Installing systemd service and udev rule..."
-if systemctl cat s3-display.service >/dev/null 2>&1; then
-    "${privilege[@]}" systemctl disable --now s3-display.service
-fi
+for legacy_service in s3-display.service health-stick.service; do
+    if systemctl cat "$legacy_service" >/dev/null 2>&1; then
+        "${privilege[@]}" systemctl disable --now "$legacy_service"
+    fi
+done
 "${privilege[@]}" rm -f \
     /etc/systemd/system/s3-display.service \
-    /etc/udev/rules.d/99-m5stick-s3.rules
+    /etc/systemd/system/health-stick.service \
+    /etc/udev/rules.d/99-m5stick-s3.rules \
+    /etc/udev/rules.d/99-health-stick.rules \
+    /usr/local/bin/health-stick-host
 "${privilege[@]}" install -m 0755 \
-    "$install_dir/health-stick-host" /usr/local/bin/health-stick-host
+    "$install_dir/servatory-host" /usr/local/bin/servatory-host
 "${privilege[@]}" install -m 0644 \
-    "$install_dir/99-health-stick.rules" /etc/udev/rules.d/99-health-stick.rules
+    "$install_dir/99-servatory.rules" /etc/udev/rules.d/99-servatory.rules
 "${privilege[@]}" install -m 0644 \
-    "$install_dir/health-stick.service" /etc/systemd/system/health-stick.service
-if [[ ! -e /etc/health-stick/config.yaml ]]; then
-    "${privilege[@]}" install -d -m 0755 /etc/health-stick
-    "${privilege[@]}" install -m 0644 "$install_dir/health-stick.yaml" /etc/health-stick/config.yaml
+    "$install_dir/servatory.service" /etc/systemd/system/servatory.service
+if [[ ! -e /etc/servatory/config.yaml ]]; then
+    "${privilege[@]}" install -d -m 0755 /etc/servatory
+    if [[ -e /etc/health-stick/config.yaml ]]; then
+        echo "Preserving the existing configuration as /etc/servatory/config.yaml..."
+        "${privilege[@]}" install -m 0644 /etc/health-stick/config.yaml /etc/servatory/config.yaml
+    else
+        "${privilege[@]}" install -m 0644 "$install_dir/servatory.yaml" /etc/servatory/config.yaml
+    fi
 fi
-"${privilege[@]}" /usr/local/bin/health-stick-host --config /etc/health-stick/config.yaml --check-config
+"${privilege[@]}" /usr/local/bin/servatory-host --config /etc/servatory/config.yaml --check-config
 
 "${privilege[@]}" udevadm control --reload-rules
 "${privilege[@]}" systemctl daemon-reload
-"${privilege[@]}" systemctl enable health-stick.service
-"${privilege[@]}" systemctl restart health-stick.service
+"${privilege[@]}" systemctl enable servatory.service
+"${privilege[@]}" systemctl restart servatory.service
 "${privilege[@]}" udevadm trigger
 "${privilege[@]}" udevadm settle
 
-if [[ -e /dev/health-stick ]]; then
-    echo "Installed and started health-stick.service; the display is connected."
+if [[ -e /dev/servatory ]]; then
+    echo "Installed and started servatory.service; the display is connected."
 else
-    echo "Installed and started health-stick.service; it is waiting for the display."
+    echo "Installed and started servatory.service; it is waiting for the display."
 fi

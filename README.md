@@ -1,6 +1,6 @@
-# health-stick
+# Servatory
 
-health-stick turns an M5Stack StickS3 into a small, USB-connected status display
+Servatory turns an M5Stack StickS3 into a small, USB-connected status display
 for a Proxmox server. A daemon on the server collects host, storage, network,
 UPS, backup, and guest information and sends it to the display. The StickS3 does
 not use Wi-Fi or Bluetooth.
@@ -17,7 +17,7 @@ pages automatically when their contents do not fit on one screen.
 - [Rust](https://rustup.rs/) on the computer that builds the host service.
 
 The UPS view uses a local NUT server when `sources.ups.endpoint` is configured.
-SMART monitoring requires `smartctl` with JSON support. health-stick queries
+SMART monitoring requires `smartctl` with JSON support. Servatory queries
 SMART data without waking sleeping disks.
 
 ## Build and install the host service
@@ -27,26 +27,26 @@ Espressif toolchain. Build it on the Proxmox host or another compatible Linux
 computer:
 
 ```sh
-cargo build --release -p health-stick-host
+cargo build --release -p servatory-host
 ```
 
 Copy the resulting binary and deployment files to the Proxmox host if you built
 them elsewhere. Then install the service, configuration, and udev rule:
 
 ```sh
-sudo install -m 0755 target/release/health-stick-host /usr/local/bin/
-sudo install -d -m 0755 /etc/health-stick
-sudo install -m 0644 deploy/health-stick.yaml /etc/health-stick/config.yaml
-sudo install -m 0644 deploy/99-health-stick.rules /etc/udev/rules.d/
-sudo install -m 0644 deploy/health-stick.service /etc/systemd/system/
+sudo install -m 0755 target/release/servatory-host /usr/local/bin/
+sudo install -d -m 0755 /etc/servatory
+sudo install -m 0644 deploy/servatory.yaml /etc/servatory/config.yaml
+sudo install -m 0644 deploy/99-servatory.rules /etc/udev/rules.d/
+sudo install -m 0644 deploy/servatory.service /etc/systemd/system/
 sudo udevadm control --reload-rules
 sudo systemctl daemon-reload
-sudo systemctl enable --now health-stick.service
+sudo systemctl enable --now servatory.service
 sudo udevadm trigger
 ```
 
 The configuration command above is for a first installation. Do not overwrite
-`/etc/health-stick/config.yaml` when updating an existing installation.
+`/etc/servatory/config.yaml` when updating an existing installation.
 
 The supplied configuration assumes:
 
@@ -61,10 +61,10 @@ health rules, views, timings, and shutdown control.
 After editing the installed file, validate it before restarting the service:
 
 ```sh
-sudo /usr/local/bin/health-stick-host \
-  --config /etc/health-stick/config.yaml \
+sudo /usr/local/bin/servatory-host \
+  --config /etc/servatory/config.yaml \
   --check-config
-sudo systemctl restart health-stick.service
+sudo systemctl restart servatory.service
 ```
 
 The daemon rejects unknown schema fields, duplicate resource identifiers,
@@ -77,6 +77,11 @@ The supplied remote installer can cross-compile the host service on a Mac and
 install it over SSH. This route is useful when you do not want a Rust toolchain
 or build packages on the Proxmox host. It is not required to build or run the
 service.
+
+When updating an earlier Health Stick installation, the remote installer copies
+the existing configuration to `/etc/servatory/config.yaml` and retires the old
+binary, systemd unit, and udev rule. It leaves the old configuration directory
+in place as a backup.
 
 Install Zig and `cargo-zigbuild` on the Mac:
 
@@ -94,7 +99,7 @@ Connect the StickS3 to the Proxmox host, then run:
 Replace `alex` with a regular server account that has `sudo` access and
 `pve.local` with the server's hostname or IP address. The installer refuses root
 SSH. It builds a static Linux binary, uploads the required files, and starts
-`health-stick.service`. The first installation creates the configuration file;
+`servatory.service`. The first installation creates the configuration file;
 later installations preserve it.
 
 ## Flash the StickS3
@@ -113,8 +118,8 @@ StickS3 while it remains connected to the Proxmox host:
 ./deploy/flash-remote-firmware.sh alex@pve.local
 ```
 
-The script temporarily stops the health-stick service, flashes
-`/dev/health-stick`, restores the service, and removes its temporary files. It
+The script temporarily stops the Servatory service, flashes
+`/dev/servatory`, restores the service, and removes its temporary files. It
 downloads a checksum-verified Linux `espflash` helper for the operation; it does
 not install flashing tools on the server.
 
@@ -144,12 +149,12 @@ valid daemon session is active.
 Show the current service state and recent messages with:
 
 ```sh
-ssh alex@pve.local systemctl status health-stick.service
-ssh alex@pve.local journalctl -u health-stick.service -n 100
+ssh alex@pve.local systemctl status servatory.service
+ssh alex@pve.local journalctl -u servatory.service -n 100
 ```
 
 The daemon starts even when the display is absent. It waits for
-`/dev/health-stick`, reconnects when the device appears, and returns to waiting
+`/dev/servatory`, reconnects when the device appears, and returns to waiting
 after a disconnect.
 
 ## Try the display with sample data
@@ -159,13 +164,13 @@ querying Proxmox. Connect the StickS3 directly to a Mac, Linux, or Windows
 computer and run:
 
 ```sh
-cargo run -p health-stick-mock-host
+cargo run -p servatory-mock-host
 ```
 
 If more than one compatible serial device is present, select one explicitly:
 
 ```sh
-cargo run -p health-stick-mock-host -- --device /dev/cu.usbmodem1101
+cargo run -p servatory-mock-host -- --device /dev/cu.usbmodem1101
 ```
 
 A long press in mock mode prints the shutdown request and exits. It never shuts

@@ -91,8 +91,8 @@ case "$remote_arch" in
         ;;
 esac
 
-if ! ssh "${ssh_options[@]}" -- "$remote_host" 'test -e /dev/health-stick'; then
-    echo "The server does not currently expose /dev/health-stick." >&2
+if ! ssh "${ssh_options[@]}" -- "$remote_host" 'test -e /dev/servatory'; then
+    echo "The server does not currently expose /dev/servatory." >&2
     echo "Check that the Stick is connected and the repository's udev rule is installed." >&2
     exit 1
 fi
@@ -101,7 +101,7 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_dir=$(cd -- "$script_dir/.." && pwd)
 firmware_dir=$repo_dir/firmware
 firmware_target=xtensa-esp32s3-none-elf
-firmware_binary=$firmware_dir/target/$firmware_target/release/health-stick-firmware
+firmware_binary=$firmware_dir/target/$firmware_target/release/servatory-firmware
 
 echo "Building release firmware locally..."
 (cd "$firmware_dir" && cargo build --locked --release)
@@ -129,8 +129,8 @@ if ! file "$remote_espflash" | grep -Fq 'ELF 64-bit'; then
 fi
 
 remote_stage=$(ssh "${ssh_options[@]}" -- "$remote_host" \
-    'mktemp -d /tmp/health-stick-flash.XXXXXX')
-if [[ ! "$remote_stage" =~ ^/tmp/health-stick-flash\.[A-Za-z0-9]+$ ]]; then
+    'mktemp -d /tmp/servatory-flash.XXXXXX')
+if [[ ! "$remote_stage" =~ ^/tmp/servatory-flash\.[A-Za-z0-9]+$ ]]; then
     echo "The server returned an unexpected temporary path: $remote_stage" >&2
     exit 1
 fi

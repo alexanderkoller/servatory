@@ -172,39 +172,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
-name = "health-stick-host"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "health-stick-protocol",
- "serde",
- "serde_json",
- "serde_yaml",
- "serialport",
-]
-
-[[package]]
-name = "health-stick-mock-host"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "health-stick-host",
- "health-stick-protocol",
- "serialport",
-]
-
-[[package]]
-name = "health-stick-protocol"
-version = "0.1.0"
-dependencies = [
- "cobs",
- "postcard",
- "serde",
-]
-
-[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -394,6 +361,39 @@ dependencies = [
  "scopeguard",
  "unescaper",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "servatory-host"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "serialport",
+ "servatory-protocol",
+]
+
+[[package]]
+name = "servatory-mock-host"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serialport",
+ "servatory-host",
+ "servatory-protocol",
+]
+
+[[package]]
+name = "servatory-protocol"
+version = "0.1.0"
+dependencies = [
+ "cobs",
+ "postcard",
+ "serde",
 ]
 
 [[package]]

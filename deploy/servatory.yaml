@@ -5,7 +5,7 @@ host:
 
 connection:
   usb_serial:
-    device: /dev/health-stick
+    device: /dev/servatory
     reconnect_interval: 1s
 
 actions:
