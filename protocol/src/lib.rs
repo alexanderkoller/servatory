@@ -1,18 +1,211 @@
 #![no_std]
 
+extern crate alloc;
+
+use alloc::{string::String, vec, vec::Vec};
 use core::fmt;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-pub const PROTOCOL_VERSION: u8 = 4;
+pub const PROTOCOL_VERSION: u8 = 7;
+const FRAME_MAGIC: [u8; 2] = [0xa5, 0x5a];
 /// Maximum COBS-encoded frame size, including its trailing zero delimiter.
-pub const MAX_FRAME_LEN: usize = 512;
-pub const MAX_GUESTS: usize = 8;
-pub const MAX_GUEST_NAME_LEN: usize = 20;
-pub const MAX_HOST_NAME_LEN: usize = 20;
-pub const MAX_NETWORK_INTERFACE_LEN: usize = 15;
-pub const MAX_SMART_DEVICES: usize = 5;
-pub const MAX_SMART_LABEL_LEN: usize = 6;
+pub const MAX_FRAME_LEN: usize = 16 * 1024;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum HealthLevel {
+    Healthy,
+    Warning,
+    Critical,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SoftwareVersion(String);
+
+impl SoftwareVersion {
+    #[must_use]
+    pub fn new(value: &str) -> Self {
+        Self(String::from(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HealthReport {
+    pub level: HealthLevel,
+    message: String,
+}
+
+impl HealthReport {
+    #[must_use]
+    pub fn healthy() -> Self {
+        Self::new(HealthLevel::Healthy, "HEALTHY")
+    }
+
+    #[must_use]
+    pub fn new(level: HealthLevel, message: &str) -> Self {
+        Self {
+            level,
+            message: String::from(message),
+        }
+    }
+
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum DisplayPage {
+    Overview,
+    Resources,
+    Storage {
+        filesystems_left: bool,
+        filesystem_indices: Vec<u32>,
+        smart_indices: Vec<u32>,
+    },
+    PowerNetwork {
+        ups_left: bool,
+    },
+    Guests {
+        offset: u32,
+        limit: u32,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DisplayLabel {
+    value: String,
+}
+
+impl DisplayLabel {
+    #[must_use]
+    pub fn new(value: &str) -> Self {
+        Self {
+            value: String::from(value),
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.value
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DisplayView {
+    pub title: DisplayLabel,
+    pub page: DisplayPage,
+}
+
+impl DisplayView {
+    #[must_use]
+    pub fn new(title: DisplayLabel, page: DisplayPage) -> Self {
+        Self { title, page }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DisplayConfig {
+    pub shutdown_hold_ms: u16,
+    pub shutdown_animation_delay_ms: u16,
+    pub daemon_version: SoftwareVersion,
+    pub filesystem_labels: Vec<DisplayLabel>,
+    pages: Vec<DisplayView>,
+}
+
+impl Default for DisplayConfig {
+    fn default() -> Self {
+        Self {
+            shutdown_hold_ms: 3_000,
+            shutdown_animation_delay_ms: 200,
+            daemon_version: SoftwareVersion::new("unknown"),
+            filesystem_labels: vec![
+                DisplayLabel::new("/"),
+                DisplayLabel::new("HDD"),
+                DisplayLabel::new("BACKUP"),
+            ],
+            pages: vec![
+                DisplayView::new(DisplayLabel::new("OVERVIEW"), DisplayPage::Overview),
+                DisplayView::new(DisplayLabel::new("RESOURCES"), DisplayPage::Resources),
+                DisplayView::new(
+                    DisplayLabel::new("STORAGE + SMART"),
+                    DisplayPage::Storage {
+                        filesystems_left: true,
+                        filesystem_indices: vec![0, 1, 2],
+                        smart_indices: vec![0, 1, 2, 3, 4],
+                    },
+                ),
+                DisplayView::new(
+                    DisplayLabel::new("UPS + ETHERNET"),
+                    DisplayPage::PowerNetwork { ups_left: true },
+                ),
+                DisplayView::new(
+                    DisplayLabel::new("GUESTS 1/2"),
+                    DisplayPage::Guests {
+                        offset: 0,
+                        limit: 4,
+                    },
+                ),
+                DisplayView::new(
+                    DisplayLabel::new("GUESTS 2/2"),
+                    DisplayPage::Guests {
+                        offset: 4,
+                        limit: 4,
+                    },
+                ),
+            ],
+        }
+    }
+}
+
+impl DisplayConfig {
+    /// Creates a validated device display manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty or oversized page list, a zero hold time,
+    /// or an animation delay that does not leave time for the animation.
+    pub fn new(
+        shutdown_hold_ms: u16,
+        shutdown_animation_delay_ms: u16,
+        filesystem_labels: Vec<DisplayLabel>,
+        pages: Vec<DisplayView>,
+    ) -> Result<Self, DisplayConfigError> {
+        if pages.is_empty()
+            || shutdown_hold_ms == 0
+            || shutdown_animation_delay_ms >= shutdown_hold_ms
+        {
+            return Err(DisplayConfigError);
+        }
+        Ok(Self {
+            shutdown_hold_ms,
+            shutdown_animation_delay_ms,
+            daemon_version: SoftwareVersion::new("unknown"),
+            filesystem_labels,
+            pages,
+        })
+    }
+
+    #[must_use]
+    pub fn pages(&self) -> &[DisplayView] {
+        &self.pages
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DisplayConfigError;
+
+impl fmt::Display for DisplayConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("display must have pages and animation delay must precede hold time")
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[repr(transparent)]
@@ -133,87 +326,43 @@ pub enum SmartStatus {
     Unknown,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SmartDeviceSummary {
     pub status: SmartStatus,
     pub temperature_celsius: Option<i8>,
-    label_len: u8,
-    label: [u8; MAX_SMART_LABEL_LEN],
+    label: String,
 }
 
 impl SmartDeviceSummary {
-    pub const EMPTY: Self = Self {
-        status: SmartStatus::Unknown,
-        temperature_celsius: None,
-        label_len: 0,
-        label: [0; MAX_SMART_LABEL_LEN],
-    };
-
-    /// Creates one bounded SMART device row.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SmartLabelError::TooLong`] when the label exceeds the wire limit.
-    pub fn new(
-        label: &str,
-        status: SmartStatus,
-        temperature_celsius: Option<i8>,
-    ) -> Result<Self, SmartLabelError> {
-        if label.len() > MAX_SMART_LABEL_LEN {
-            return Err(SmartLabelError::TooLong);
-        }
-        let mut bytes = [0; MAX_SMART_LABEL_LEN];
-        bytes[..label.len()].copy_from_slice(label.as_bytes());
-        Ok(Self {
+    #[must_use]
+    pub fn new(label: &str, status: SmartStatus, temperature_celsius: Option<i8>) -> Self {
+        Self {
             status,
             temperature_celsius,
-            label_len: u8::try_from(label.len()).unwrap_or(0),
-            label: bytes,
-        })
+            label: String::from(label),
+        }
     }
 
     #[must_use]
     pub fn label(&self) -> &str {
-        let len = usize::from(self.label_len).min(MAX_SMART_LABEL_LEN);
-        core::str::from_utf8(&self.label[..len]).unwrap_or("?")
+        &self.label
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SmartLabelError {
-    TooLong,
-}
-
-impl fmt::Display for SmartLabelError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SMART label exceeds {MAX_SMART_LABEL_LEN} bytes")
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SmartSnapshot {
-    len: u8,
-    devices: [SmartDeviceSummary; MAX_SMART_DEVICES],
+    devices: Vec<SmartDeviceSummary>,
 }
 
 impl SmartSnapshot {
-    pub const EMPTY: Self = Self {
-        len: 0,
-        devices: [SmartDeviceSummary::EMPTY; MAX_SMART_DEVICES],
-    };
-
     #[must_use]
-    pub fn from_slice(devices: &[SmartDeviceSummary]) -> Self {
-        let len = devices.len().min(MAX_SMART_DEVICES);
-        let mut snapshot = Self::EMPTY;
-        snapshot.devices[..len].copy_from_slice(&devices[..len]);
-        snapshot.len = u8::try_from(len).unwrap_or(0);
-        snapshot
+    pub fn new(devices: Vec<SmartDeviceSummary>) -> Self {
+        Self { devices }
     }
 
     #[must_use]
     pub fn devices(&self) -> &[SmartDeviceSummary] {
-        &self.devices[..usize::from(self.len).min(MAX_SMART_DEVICES)]
+        &self.devices
     }
 }
 
@@ -260,7 +409,7 @@ impl FilesystemUsage {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GuestSummary {
     pub vmid: u32,
     pub kind: GuestKind,
@@ -268,27 +417,11 @@ pub struct GuestSummary {
     pub cpu_percent: u8,
     pub memory_used_mib: u32,
     pub memory_total_mib: u32,
-    name_len: u8,
-    name: [u8; MAX_GUEST_NAME_LEN],
+    name: String,
 }
 
 impl GuestSummary {
-    pub const EMPTY: Self = Self {
-        vmid: 0,
-        kind: GuestKind::VirtualMachine,
-        status: GuestStatus::Stopped,
-        cpu_percent: 0,
-        memory_used_mib: 0,
-        memory_total_mib: 0,
-        name_len: 0,
-        name: [0; MAX_GUEST_NAME_LEN],
-    };
-
-    /// Creates a bounded, allocation-free guest summary.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`GuestNameError::TooLong`] when the UTF-8 name exceeds the wire limit.
+    #[must_use]
     pub fn new(
         vmid: u32,
         name: &str,
@@ -297,81 +430,51 @@ impl GuestSummary {
         cpu_percent: u8,
         memory_used_mib: u32,
         memory_total_mib: u32,
-    ) -> Result<Self, GuestNameError> {
-        if name.len() > MAX_GUEST_NAME_LEN {
-            return Err(GuestNameError::TooLong);
-        }
-        let mut bytes = [0; MAX_GUEST_NAME_LEN];
-        bytes[..name.len()].copy_from_slice(name.as_bytes());
-        Ok(Self {
+    ) -> Self {
+        Self {
             vmid,
             kind,
             status,
             cpu_percent: cpu_percent.min(100),
             memory_used_mib,
             memory_total_mib,
-            name_len: u8::try_from(name.len()).unwrap_or(0),
-            name: bytes,
-        })
+            name: String::from(name),
+        }
     }
 
     #[must_use]
     pub fn name(&self) -> &str {
-        let len = usize::from(self.name_len).min(MAX_GUEST_NAME_LEN);
-        core::str::from_utf8(&self.name[..len]).unwrap_or("?")
+        &self.name
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GuestNameError {
-    TooLong,
-}
-
-impl fmt::Display for GuestNameError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "guest name exceeds {MAX_GUEST_NAME_LEN} bytes")
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GuestSnapshot {
-    len: u8,
-    guests: [GuestSummary; MAX_GUESTS],
+    guests: Vec<GuestSummary>,
 }
 
 impl GuestSnapshot {
-    pub const EMPTY: Self = Self {
-        len: 0,
-        guests: [GuestSummary::EMPTY; MAX_GUESTS],
-    };
-
-    /// Copies as many guests as fit in one protocol snapshot.
     #[must_use]
-    pub fn from_slice(guests: &[GuestSummary]) -> Self {
-        let len = guests.len().min(MAX_GUESTS);
-        let mut snapshot = Self::EMPTY;
-        snapshot.guests[..len].copy_from_slice(&guests[..len]);
-        snapshot.len = u8::try_from(len).unwrap_or(0);
-        snapshot
+    pub fn new(guests: Vec<GuestSummary>) -> Self {
+        Self { guests }
     }
 
     #[must_use]
     pub fn guests(&self) -> &[GuestSummary] {
-        &self.guests[..usize::from(self.len).min(MAX_GUESTS)]
+        &self.guests
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct HealthSnapshot {
+    pub health: HealthReport,
     pub uptime_seconds: u64,
     pub cpu_percent: u8,
     pub memory_used_mib: u32,
     pub memory_total_mib: u32,
     pub io_pressure_percent: u8,
     pub load_average_x100: u16,
-    pub root_storage: FilesystemUsage,
-    pub hdd_storage: FilesystemUsage,
-    pub backup_storage: FilesystemUsage,
+    pub filesystems: Vec<FilesystemUsage>,
     pub backup_job_status: BackupJobStatus,
     pub last_successful_backup_age_seconds: Option<u32>,
     pub network_up: bool,
@@ -382,159 +485,12 @@ pub struct HealthSnapshot {
     pub guests: GuestSnapshot,
     pub ups: UpsSnapshot,
     pub smart: SmartSnapshot,
-    host_name_len: u8,
-    host_name: [u8; MAX_HOST_NAME_LEN],
-    network_interface_len: u8,
-    network_interface: [u8; MAX_NETWORK_INTERFACE_LEN],
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HealthStatus {
-    Healthy,
-    Warning(WarningCause),
-    Critical(CriticalCause),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WarningCause {
-    UpsOnBattery,
-    UpsBypass,
-    UpsUnavailable,
-    SmartWarning,
-    Cpu(u8),
-    Memory(u8),
-    IoPressure(u8),
-    BackupOverdue,
-    BackupFailed,
-    BackupNoJob,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CriticalCause {
-    UpsLowBattery,
-    UpsOutputOff,
-    UpsReplaceBattery,
-    SmartFailed,
-    LinkDown,
-    PingFailed,
-    RootStorage(FilesystemUsage),
-    HddStorage(FilesystemUsage),
-    BackupStorage(FilesystemUsage),
-    BackupUnknown,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HealthCause {
-    Warning(WarningCause),
-    Critical(CriticalCause),
-}
-
-impl HealthStatus {
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Healthy => "HEALTHY",
-            Self::Warning(_) => "WARNING",
-            Self::Critical(_) => "CRITICAL",
-        }
-    }
-
-    #[must_use]
-    pub const fn cause(self) -> Option<HealthCause> {
-        match self {
-            Self::Healthy => None,
-            Self::Warning(cause) => Some(HealthCause::Warning(cause)),
-            Self::Critical(cause) => Some(HealthCause::Critical(cause)),
-        }
-    }
-
-    /// Returns whether two statuses represent the same condition, ignoring
-    /// changing measurements such as CPU percentage and free storage.
-    #[must_use]
-    pub fn same_condition(self, other: Self) -> bool {
-        match (self, other) {
-            (Self::Healthy, Self::Healthy) => true,
-            (Self::Warning(left), Self::Warning(right)) => {
-                core::mem::discriminant(&left) == core::mem::discriminant(&right)
-            }
-            (Self::Critical(left), Self::Critical(right)) => {
-                core::mem::discriminant(&left) == core::mem::discriminant(&right)
-            }
-            _ => false,
-        }
-    }
-}
-
-impl fmt::Display for HealthStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.cause() {
-            Some(cause) => write!(f, "{}: {cause}", self.label()),
-            None => f.write_str(self.label()),
-        }
-    }
-}
-
-impl fmt::Display for HealthCause {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Warning(cause) => cause.fmt(f),
-            Self::Critical(cause) => cause.fmt(f),
-        }
-    }
-}
-
-impl fmt::Display for WarningCause {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UpsOnBattery => f.write_str("UPS ON BATTERY"),
-            Self::UpsBypass => f.write_str("UPS BYPASS"),
-            Self::UpsUnavailable => f.write_str("UPS UNAVAILABLE"),
-            Self::SmartWarning => f.write_str("SMART WARNING"),
-            Self::Cpu(percent) => write!(f, "CPU {percent}%"),
-            Self::Memory(percent) => write!(f, "MEMORY {percent}%"),
-            Self::IoPressure(percent) => write!(f, "IO PRESS {percent}%"),
-            Self::BackupOverdue => f.write_str("BACKUP OVERDUE"),
-            Self::BackupFailed => f.write_str("BACKUP FAILED"),
-            Self::BackupNoJob => f.write_str("BACKUP NO JOB"),
-        }
-    }
-}
-
-impl fmt::Display for CriticalCause {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UpsLowBattery => f.write_str("UPS LOW BATTERY"),
-            Self::UpsOutputOff => f.write_str("UPS OUTPUT OFF"),
-            Self::UpsReplaceBattery => f.write_str("UPS REPLACE BAT"),
-            Self::SmartFailed => f.write_str("SMART FAILED"),
-            Self::LinkDown => f.write_str("LINK DOWN"),
-            Self::PingFailed => f.write_str("PING FAILED"),
-            Self::RootStorage(usage) => write_storage_cause(f, "ROOT", *usage),
-            Self::HddStorage(usage) => write_storage_cause(f, "HDD", *usage),
-            Self::BackupStorage(usage) => write_storage_cause(f, "BACKUP", *usage),
-            Self::BackupUnknown => f.write_str("BACKUP UNKNOWN"),
-        }
-    }
-}
-
-fn write_storage_cause(
-    f: &mut fmt::Formatter<'_>,
-    label: &str,
-    usage: FilesystemUsage,
-) -> fmt::Result {
-    if usage.mounted {
-        write!(f, "{label} {}% FULL", usage.used_percent)
-    } else {
-        write!(f, "{label} MISSING")
-    }
+    host_name: String,
+    network_interface: String,
 }
 
 impl HealthSnapshot {
-    /// Creates a bounded, allocation-free host-health snapshot.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`HealthSnapshotError`] when either name exceeds its wire limit.
+    #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         host_name: &str,
@@ -544,9 +500,7 @@ impl HealthSnapshot {
         memory_total_mib: u32,
         io_pressure_percent: u8,
         load_average_x100: u16,
-        root_storage: FilesystemUsage,
-        hdd_storage: FilesystemUsage,
-        backup_storage: FilesystemUsage,
+        filesystems: Vec<FilesystemUsage>,
         backup_job_status: BackupJobStatus,
         last_successful_backup_age_seconds: Option<u32>,
         network_up: bool,
@@ -558,27 +512,16 @@ impl HealthSnapshot {
         guests: GuestSnapshot,
         ups: UpsSnapshot,
         smart: SmartSnapshot,
-    ) -> Result<Self, HealthSnapshotError> {
-        if host_name.len() > MAX_HOST_NAME_LEN {
-            return Err(HealthSnapshotError::HostNameTooLong);
-        }
-        if network_interface.len() > MAX_NETWORK_INTERFACE_LEN {
-            return Err(HealthSnapshotError::NetworkInterfaceTooLong);
-        }
-        let mut bytes = [0; MAX_HOST_NAME_LEN];
-        bytes[..host_name.len()].copy_from_slice(host_name.as_bytes());
-        let mut interface_bytes = [0; MAX_NETWORK_INTERFACE_LEN];
-        interface_bytes[..network_interface.len()].copy_from_slice(network_interface.as_bytes());
-        Ok(Self {
+    ) -> Self {
+        Self {
+            health: HealthReport::healthy(),
             uptime_seconds,
             cpu_percent: cpu_percent.min(100),
             memory_used_mib,
             memory_total_mib,
             io_pressure_percent: io_pressure_percent.min(100),
             load_average_x100,
-            root_storage,
-            hdd_storage,
-            backup_storage,
+            filesystems,
             backup_job_status,
             last_successful_backup_age_seconds,
             network_up,
@@ -589,135 +532,29 @@ impl HealthSnapshot {
             guests,
             ups,
             smart,
-            host_name_len: u8::try_from(host_name.len()).unwrap_or(0),
-            host_name: bytes,
-            network_interface_len: u8::try_from(network_interface.len()).unwrap_or(0),
-            network_interface: interface_bytes,
-        })
+            host_name: String::from(host_name),
+            network_interface: String::from(network_interface),
+        }
+    }
+
+    pub fn set_health(&mut self, health: HealthReport) {
+        self.health = health;
     }
 
     #[must_use]
     pub fn host_name(&self) -> &str {
-        let len = usize::from(self.host_name_len).min(MAX_HOST_NAME_LEN);
-        core::str::from_utf8(&self.host_name[..len]).unwrap_or("?")
+        &self.host_name
     }
 
     #[must_use]
     pub fn network_interface(&self) -> &str {
-        let len = usize::from(self.network_interface_len).min(MAX_NETWORK_INTERFACE_LEN);
-        core::str::from_utf8(&self.network_interface[..len]).unwrap_or("?")
-    }
-
-    #[must_use]
-    pub fn health_status(&self) -> HealthStatus {
-        if self.ups.status == UpsStatus::LowBattery {
-            return HealthStatus::Critical(CriticalCause::UpsLowBattery);
-        } else if self.ups.status == UpsStatus::OutputOff {
-            return HealthStatus::Critical(CriticalCause::UpsOutputOff);
-        } else if self.ups.status == UpsStatus::ReplaceBattery {
-            return HealthStatus::Critical(CriticalCause::UpsReplaceBattery);
-        } else if self
-            .smart
-            .devices()
-            .iter()
-            .any(|device| device.status == SmartStatus::Failed)
-        {
-            return HealthStatus::Critical(CriticalCause::SmartFailed);
-        } else if !self.network_up {
-            return HealthStatus::Critical(CriticalCause::LinkDown);
-        } else if self.internet_status == InternetStatus::Failed {
-            return HealthStatus::Critical(CriticalCause::PingFailed);
-        } else if storage_is_critical(self.root_storage) {
-            return HealthStatus::Critical(CriticalCause::RootStorage(self.root_storage));
-        } else if storage_is_critical(self.hdd_storage) {
-            return HealthStatus::Critical(CriticalCause::HddStorage(self.hdd_storage));
-        } else if storage_is_critical(self.backup_storage) {
-            return HealthStatus::Critical(CriticalCause::BackupStorage(self.backup_storage));
-        } else if self.backup_job_status == BackupJobStatus::Unknown {
-            return HealthStatus::Critical(CriticalCause::BackupUnknown);
-        }
-
-        let memory = memory_percent(self);
-        if self.ups.status == UpsStatus::OnBattery {
-            HealthStatus::Warning(WarningCause::UpsOnBattery)
-        } else if self.ups.status == UpsStatus::Bypass {
-            HealthStatus::Warning(WarningCause::UpsBypass)
-        } else if self.ups.status == UpsStatus::Unavailable
-            || (self.ups.status == UpsStatus::Unknown && !self.ups.stale)
-        {
-            HealthStatus::Warning(WarningCause::UpsUnavailable)
-        } else if self
-            .smart
-            .devices()
-            .iter()
-            .any(|device| matches!(device.status, SmartStatus::Warning | SmartStatus::Unknown))
-        {
-            HealthStatus::Warning(WarningCause::SmartWarning)
-        } else if self.cpu_percent >= 85 {
-            HealthStatus::Warning(WarningCause::Cpu(self.cpu_percent))
-        } else if memory >= 90 {
-            HealthStatus::Warning(WarningCause::Memory(memory))
-        } else if self.io_pressure_percent >= 50 {
-            HealthStatus::Warning(WarningCause::IoPressure(self.io_pressure_percent))
-        } else if let Some(cause) = backup_warning_cause(self) {
-            HealthStatus::Warning(cause)
-        } else {
-            HealthStatus::Healthy
-        }
-    }
-}
-
-fn storage_is_critical(usage: FilesystemUsage) -> bool {
-    !usage.mounted || usage.used_percent > 90
-}
-
-fn memory_percent(snapshot: &HealthSnapshot) -> u8 {
-    if snapshot.memory_total_mib == 0 {
-        0
-    } else {
-        u8::try_from(
-            u64::from(snapshot.memory_used_mib).saturating_mul(100)
-                / u64::from(snapshot.memory_total_mib),
-        )
-        .unwrap_or(100)
-    }
-}
-
-fn backup_warning_cause(snapshot: &HealthSnapshot) -> Option<WarningCause> {
-    match snapshot.backup_job_status {
-        BackupJobStatus::Healthy | BackupJobStatus::Unknown => None,
-        BackupJobStatus::Running => snapshot
-            .last_successful_backup_age_seconds
-            .is_none_or(|age| age > 24 * 60 * 60)
-            .then_some(WarningCause::BackupOverdue),
-        BackupJobStatus::NoJob => Some(WarningCause::BackupNoJob),
-        BackupJobStatus::Failed => Some(WarningCause::BackupFailed),
-        BackupJobStatus::Stale => Some(WarningCause::BackupOverdue),
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HealthSnapshotError {
-    HostNameTooLong,
-    NetworkInterfaceTooLong,
-}
-
-impl fmt::Display for HealthSnapshotError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::HostNameTooLong => write!(f, "host name exceeds {MAX_HOST_NAME_LEN} bytes"),
-            Self::NetworkInterfaceTooLong => write!(
-                f,
-                "network interface name exceeds {MAX_NETWORK_INTERFACE_LEN} bytes"
-            ),
-        }
+        &self.network_interface
     }
 }
 
 /// Host-to-device messages. Variants may only be appended within a protocol version.
-// The no_std firmware deliberately uses a fixed-size inline snapshot instead of allocation.
 #[allow(clippy::large_enum_variant)]
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum HostMessage {
     /// A content-neutral heartbeat. Screen data will be added after the UI is designed.
     Update {
@@ -744,6 +581,10 @@ pub enum HostMessage {
         reason: ShutdownFailure,
         guests_remaining: u16,
     },
+    DisplayConfig(DisplayConfig),
+    Hello {
+        daemon_version: SoftwareVersion,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -753,11 +594,12 @@ pub enum ButtonAction {
 }
 
 /// Device-to-host messages. Variants may only be appended within a protocol version.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum DeviceMessage {
     Ready,
     Ack { sequence: Sequence },
     Button(ButtonAction),
+    Hello { firmware_version: SoftwareVersion },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -773,12 +615,6 @@ impl fmt::Display for ProtocolError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{self:?}")
     }
-}
-
-#[derive(Deserialize, Serialize)]
-struct Envelope<T> {
-    version: u8,
-    message: T,
 }
 
 /// Serializes and COBS-frames one host-to-device message.
@@ -821,25 +657,37 @@ pub fn decode_device(frame: &mut [u8]) -> Result<DeviceMessage, ProtocolError> {
 }
 
 fn encode<T: Serialize>(message: T, output: &mut [u8]) -> Result<&mut [u8], ProtocolError> {
-    postcard::to_slice_cobs(
-        &Envelope {
-            version: PROTOCOL_VERSION,
-            message,
-        },
-        output,
-    )
-    .map_err(|_| ProtocolError::Serialize)
+    if output.len() < 3 {
+        return Err(ProtocolError::Serialize);
+    }
+    output[..2].copy_from_slice(&FRAME_MAGIC);
+    output[2] = PROTOCOL_VERSION;
+    let payload = postcard::to_slice_cobs(&message, &mut output[3..])
+        .map_err(|_| ProtocolError::Serialize)?;
+    let len = payload.len() + 3;
+    Ok(&mut output[..len])
 }
 
 fn decode<T: DeserializeOwned>(frame: &mut [u8]) -> Result<T, ProtocolError> {
-    let envelope: Envelope<T> =
-        postcard::from_bytes_cobs(frame).map_err(|_| ProtocolError::Deserialize)?;
-    if envelope.version != PROTOCOL_VERSION {
-        return Err(ProtocolError::UnsupportedVersion {
-            received: envelope.version,
-        });
+    if frame.starts_with(&FRAME_MAGIC) {
+        let (version, payload) = frame[2..]
+            .split_first_mut()
+            .ok_or(ProtocolError::EmptyFrame)?;
+        if *version != PROTOCOL_VERSION {
+            return Err(ProtocolError::UnsupportedVersion { received: *version });
+        }
+        return postcard::from_bytes_cobs(payload).map_err(|_| ProtocolError::Deserialize);
     }
-    Ok(envelope.message)
+
+    // Protocols through v5 encoded the version inside the COBS body. Recover
+    // only that leading byte for a useful upgrade diagnostic; the old message
+    // schema is deliberately not decoded.
+    let decoded_len = cobs::decode_in_place(frame).map_err(|_| ProtocolError::Deserialize)?;
+    let received = *frame
+        .get(..decoded_len)
+        .and_then(|decoded| decoded.first())
+        .ok_or(ProtocolError::Deserialize)?;
+    Err(ProtocolError::UnsupportedVersion { received })
 }
 
 /// Extracts zero-delimited COBS frames from an arbitrary byte stream.
@@ -906,18 +754,32 @@ mod tests {
 
     use super::*;
 
-    fn healthy_snapshot() -> HealthSnapshot {
+    fn guest(name: &str) -> GuestSummary {
+        GuestSummary::new(
+            100,
+            name,
+            GuestKind::VirtualMachine,
+            GuestStatus::Running,
+            23,
+            3_104,
+            8_192,
+        )
+    }
+
+    fn snapshot(guests: Vec<GuestSummary>) -> HealthSnapshot {
         HealthSnapshot::new(
             "pve-01",
             86_400,
             23,
-            16_384,
+            18_688,
             32_768,
             4,
             82,
-            FilesystemUsage::new(20, 80 * 1_024),
-            FilesystemUsage::new(30, 7_000 * 1_024),
-            FilesystemUsage::new(40, 4_000 * 1_024),
+            vec![
+                FilesystemUsage::new(6, 85 * 1_024),
+                FilesystemUsage::new(33, 6_186_598),
+                FilesystemUsage::new(60, 3_670_016),
+            ],
             BackupJobStatus::Healthy,
             Some(21_600),
             true,
@@ -926,103 +788,15 @@ mod tests {
             InternetStatus::Reachable,
             Some(0),
             [10, 0, 0, 12],
-            GuestSnapshot::EMPTY,
+            GuestSnapshot::new(guests),
             UpsSnapshot::NOT_CONFIGURED,
-            SmartSnapshot::EMPTY,
+            SmartSnapshot::default(),
         )
-        .unwrap()
-    }
-
-    #[test]
-    fn health_statuses_always_carry_typed_causes() {
-        let mut snapshot = healthy_snapshot();
-        assert_eq!(snapshot.health_status(), HealthStatus::Healthy);
-        assert_eq!(snapshot.health_status().cause(), None);
-
-        snapshot.internet_status = InternetStatus::Missed;
-        assert_eq!(snapshot.health_status(), HealthStatus::Healthy);
-
-        snapshot.cpu_percent = 85;
-        let warning = snapshot.health_status();
-        assert_eq!(warning, HealthStatus::Warning(WarningCause::Cpu(85)));
-        assert_eq!(
-            warning.cause(),
-            Some(HealthCause::Warning(WarningCause::Cpu(85)))
-        );
-
-        snapshot.network_up = false;
-        let critical = snapshot.health_status();
-        assert_eq!(critical, HealthStatus::Critical(CriticalCause::LinkDown));
-        assert_eq!(
-            critical.cause(),
-            Some(HealthCause::Critical(CriticalCause::LinkDown))
-        );
-    }
-
-    #[test]
-    fn ups_and_smart_conditions_affect_overall_health() {
-        let mut snapshot = healthy_snapshot();
-        snapshot.ups = UpsSnapshot {
-            status: UpsStatus::OnBattery,
-            battery_percent: Some(80),
-            load_percent: Some(15),
-            runtime_seconds: Some(1_800),
-            estimated_watts: Some(102),
-            stale: false,
-        };
-        assert_eq!(
-            snapshot.health_status(),
-            HealthStatus::Warning(WarningCause::UpsOnBattery)
-        );
-
-        snapshot.smart = SmartSnapshot::from_slice(&[SmartDeviceSummary::new(
-            "HDD",
-            SmartStatus::Failed,
-            Some(31),
-        )
-        .unwrap()]);
-        assert_eq!(
-            snapshot.health_status(),
-            HealthStatus::Critical(CriticalCause::SmartFailed)
-        );
-
-        snapshot.ups.status = UpsStatus::LowBattery;
-        assert_eq!(
-            snapshot.health_status(),
-            HealthStatus::Critical(CriticalCause::UpsLowBattery)
-        );
-    }
-
-    #[test]
-    fn changing_measurements_do_not_create_new_health_conditions() {
-        assert!(
-            HealthStatus::Warning(WarningCause::Cpu(85))
-                .same_condition(HealthStatus::Warning(WarningCause::Cpu(99)))
-        );
-        assert!(
-            HealthStatus::Critical(CriticalCause::RootStorage(FilesystemUsage::new(91, 100)))
-                .same_condition(HealthStatus::Critical(CriticalCause::RootStorage(
-                    FilesystemUsage::new(99, 10),
-                )))
-        );
-        assert!(
-            !HealthStatus::Warning(WarningCause::Cpu(99))
-                .same_condition(HealthStatus::Warning(WarningCause::Memory(99)))
-        );
     }
 
     #[test]
     fn messages_round_trip_as_typed_values() {
-        let guest = GuestSummary::new(
-            100,
-            "atlas",
-            GuestKind::VirtualMachine,
-            GuestStatus::Running,
-            23,
-            3_104,
-            8_192,
-        )
-        .unwrap();
+        let guest = guest("atlas");
         let host_messages = [
             HostMessage::Update {
                 sequence: Sequence::new(42),
@@ -1032,35 +806,12 @@ mod tests {
             HostMessage::GuestSnapshot {
                 sequence: Sequence::new(43),
                 unix_seconds: UnixSeconds::new(1_700_000_005),
-                snapshot: GuestSnapshot::from_slice(&[guest]),
+                snapshot: GuestSnapshot::new(vec![guest.clone()]),
             },
             HostMessage::HealthSnapshot {
                 sequence: Sequence::new(44),
                 unix_seconds: UnixSeconds::new(1_700_000_010),
-                snapshot: HealthSnapshot::new(
-                    "pve-01",
-                    86_400,
-                    23,
-                    18_688,
-                    32_768,
-                    4,
-                    82,
-                    FilesystemUsage::new(6, 85 * 1_024),
-                    FilesystemUsage::new(33, 6_186_598),
-                    FilesystemUsage::new(60, 3_670_016),
-                    BackupJobStatus::Healthy,
-                    Some(21_600),
-                    true,
-                    2_500,
-                    "enp3s0",
-                    InternetStatus::Reachable,
-                    Some(0),
-                    [10, 0, 0, 12],
-                    GuestSnapshot::from_slice(&[guest]),
-                    UpsSnapshot::NOT_CONFIGURED,
-                    SmartSnapshot::EMPTY,
-                )
-                .unwrap(),
+                snapshot: snapshot(vec![guest]),
             },
             HostMessage::ShutdownProgress {
                 phase: ShutdownPhase::StoppingGuests,
@@ -1071,10 +822,13 @@ mod tests {
                 reason: ShutdownFailure::GuestShutdown,
                 guests_remaining: 2,
             },
+            HostMessage::Hello {
+                daemon_version: SoftwareVersion::new("0.1.0"),
+            },
         ];
         for expected in host_messages {
             let mut storage = [0; MAX_FRAME_LEN];
-            let frame = encode_host(expected, &mut storage).unwrap();
+            let frame = encode_host(expected.clone(), &mut storage).unwrap();
             assert_eq!(decode_host(frame), Ok(expected));
         }
 
@@ -1085,10 +839,13 @@ mod tests {
             },
             DeviceMessage::Button(ButtonAction::NextScreen),
             DeviceMessage::Button(ButtonAction::ShutdownRequested),
+            DeviceMessage::Hello {
+                firmware_version: SoftwareVersion::new("0.1.0"),
+            },
         ];
         for expected in device_messages {
             let mut storage = [0; 32];
-            let frame = encode_device(expected, &mut storage).unwrap();
+            let frame = encode_device(expected.clone(), &mut storage).unwrap();
             assert_eq!(decode_device(frame), Ok(expected));
         }
     }
@@ -1099,7 +856,7 @@ mod tests {
             sequence: Sequence::new(81),
         };
         let mut encoded = [0; 32];
-        let frame = encode_device(expected, &mut encoded).unwrap();
+        let frame = encode_device(expected.clone(), &mut encoded).unwrap();
         let mut decoder = FrameDecoder::<32>::new();
         let mut received = None;
         for &byte in frame.iter() {
@@ -1126,19 +883,45 @@ mod tests {
     #[test]
     fn incompatible_version_is_rejected() {
         let mut storage = [0; 32];
+        // Deliberately use an unrelated payload type. Version inspection must
+        // happen before decoding the version-specific message schema.
+        storage[..6].copy_from_slice(&[
+            FRAME_MAGIC[0],
+            FRAME_MAGIC[1],
+            PROTOCOL_VERSION + 1,
+            0xfe,
+            0xed,
+            0,
+        ]);
+        let frame = &mut storage[..6];
+        assert_eq!(
+            decode_device(frame),
+            Err(ProtocolError::UnsupportedVersion {
+                received: PROTOCOL_VERSION + 1
+            })
+        );
+    }
+
+    #[test]
+    fn legacy_envelope_reports_its_actual_version() {
+        #[derive(Serialize)]
+        struct LegacyEnvelope {
+            version: u8,
+            message: u16,
+        }
+
+        let mut storage = [0; 32];
         let frame = postcard::to_slice_cobs(
-            &Envelope {
-                version: PROTOCOL_VERSION + 1,
-                message: DeviceMessage::Ready,
+            &LegacyEnvelope {
+                version: 5,
+                message: 0xfeed,
             },
             &mut storage,
         )
         .unwrap();
         assert_eq!(
             decode_device(frame),
-            Err(ProtocolError::UnsupportedVersion {
-                received: PROTOCOL_VERSION + 1
-            })
+            Err(ProtocolError::UnsupportedVersion { received: 5 })
         );
     }
 
@@ -1157,142 +940,37 @@ mod tests {
     }
 
     #[test]
-    fn guest_names_and_snapshot_counts_are_bounded() {
-        assert_eq!(
-            GuestSummary::new(
-                100,
-                "a-name-that-is-longer-than-twenty-bytes",
-                GuestKind::Container,
-                GuestStatus::Running,
-                150,
-                1,
-                2,
-            ),
-            Err(GuestNameError::TooLong)
-        );
+    fn snapshots_use_dynamic_names_and_counts() {
+        let long_name = "guest-name-that-is-not-a-firmware-sized-array";
+        let guests = vec![guest(long_name); 40];
+        let value = snapshot(guests);
+        assert_eq!(value.guests.guests().len(), 40);
+        assert_eq!(value.guests.guests()[0].name(), long_name);
 
-        let guests = [GuestSummary::EMPTY; MAX_GUESTS + 1];
-        assert_eq!(
-            GuestSnapshot::from_slice(&guests).guests().len(),
-            MAX_GUESTS
-        );
-    }
-
-    #[test]
-    fn network_interface_names_are_bounded() {
-        assert_eq!(
-            HealthSnapshot::new(
-                "pve-01",
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                FilesystemUsage::MISSING,
-                FilesystemUsage::MISSING,
-                FilesystemUsage::MISSING,
-                BackupJobStatus::Unknown,
-                None,
-                true,
-                2_500,
-                "interface-name-too-long",
-                InternetStatus::Checking,
-                None,
-                [0; 4],
-                GuestSnapshot::EMPTY,
-                UpsSnapshot::NOT_CONFIGURED,
-                SmartSnapshot::EMPTY,
-            ),
-            Err(HealthSnapshotError::NetworkInterfaceTooLong)
-        );
-    }
-
-    #[test]
-    fn largest_guest_snapshot_fits_the_frame_buffer() {
-        let guest = GuestSummary::new(
-            u32::MAX,
-            "12345678901234567890",
-            GuestKind::VirtualMachine,
-            GuestStatus::Running,
-            100,
-            u32::MAX,
-            u32::MAX,
-        )
-        .unwrap();
-        let mut storage = [0; MAX_FRAME_LEN];
-        let frame = encode_host(
-            HostMessage::GuestSnapshot {
-                sequence: Sequence::new(u32::MAX),
-                unix_seconds: UnixSeconds::new(u64::MAX),
-                snapshot: GuestSnapshot::from_slice(&[guest; MAX_GUESTS]),
-            },
-            &mut storage,
-        )
-        .unwrap();
-        assert!(frame.len() <= MAX_FRAME_LEN);
-    }
-
-    #[test]
-    fn largest_health_snapshot_fits_the_frame_buffer() {
-        let guest = GuestSummary::new(
-            u32::MAX,
-            "12345678901234567890",
-            GuestKind::VirtualMachine,
-            GuestStatus::Running,
-            100,
-            u32::MAX,
-            u32::MAX,
-        )
-        .unwrap();
-        let snapshot = HealthSnapshot::new(
-            "12345678901234567890",
-            u64::MAX,
-            100,
-            u32::MAX,
-            u32::MAX,
-            100,
-            u16::MAX,
-            FilesystemUsage::new(100, u32::MAX),
-            FilesystemUsage::new(100, u32::MAX),
-            FilesystemUsage::new(100, u32::MAX),
-            BackupJobStatus::Failed,
-            Some(u32::MAX),
-            true,
-            u16::MAX,
-            "123456789012345",
-            InternetStatus::Failed,
-            Some(u32::MAX),
-            [255; 4],
-            GuestSnapshot::from_slice(&[guest; MAX_GUESTS]),
-            UpsSnapshot {
-                status: UpsStatus::ReplaceBattery,
-                battery_percent: Some(100),
-                load_percent: Some(100),
-                runtime_seconds: Some(u32::MAX),
-                estimated_watts: Some(u16::MAX),
-                stale: true,
-            },
-            SmartSnapshot::from_slice(
-                &[SmartDeviceSummary {
-                    status: SmartStatus::Failed,
-                    temperature_celsius: Some(i8::MAX),
-                    label_len: u8::try_from(MAX_SMART_LABEL_LEN).unwrap(),
-                    label: [b'X'; MAX_SMART_LABEL_LEN],
-                }; MAX_SMART_DEVICES],
-            ),
-        )
-        .unwrap();
         let mut storage = [0; MAX_FRAME_LEN];
         let frame = encode_host(
             HostMessage::HealthSnapshot {
                 sequence: Sequence::new(u32::MAX),
                 unix_seconds: UnixSeconds::new(u64::MAX),
-                snapshot,
+                snapshot: value,
             },
             &mut storage,
         )
         .unwrap();
         assert!(frame.len() <= MAX_FRAME_LEN);
+    }
+
+    #[test]
+    fn frame_budget_is_the_only_collection_limit() {
+        let mut storage = [0; 128];
+        let oversized_for_this_transport = HostMessage::GuestSnapshot {
+            sequence: Sequence::ZERO,
+            unix_seconds: UnixSeconds::new(0),
+            snapshot: GuestSnapshot::new(vec![guest("long-enough-name"); 40]),
+        };
+        assert_eq!(
+            encode_host(oversized_for_this_transport, &mut storage),
+            Err(ProtocolError::Serialize)
+        );
     }
 }

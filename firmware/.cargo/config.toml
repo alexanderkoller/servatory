@@ -1,9 +1,15 @@
 [target.xtensa-esp32s3-none-elf]
+linker = "xtensa-esp-elf-gcc"
 runner = "espflash flash --chip esp32s3 --after watchdog-reset"
 
 [build]
-rustflags = ["-C", "link-arg=-nostartfiles"]
+rustflags = [
+    "-C",
+    "link-arg=-nostartfiles",
+    "-C",
+    "link-arg=-mdynconfig=xtensa_esp32s3.so",
+]
 target = "xtensa-esp32s3-none-elf"
 
 [unstable]
-build-std = ["core"]
+build-std = ["alloc", "core"]

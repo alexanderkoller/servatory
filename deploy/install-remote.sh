@@ -66,22 +66,22 @@ if ! rustup target list --installed | grep -Fxq "$rust_target"; then
 fi
 
 echo "Building a static $rust_target daemon on this computer..."
-(cd "$repo_dir" && cargo zigbuild --locked --release -p s3-display-host --target "$rust_target")
-binary_path=$repo_dir/target/$rust_target/release/s3-display-host
+(cd "$repo_dir" && cargo zigbuild --locked --release -p health-stick-host --target "$rust_target")
+binary_path=$repo_dir/target/$rust_target/release/health-stick-host
 if ! file "$binary_path" | grep -Fq 'statically linked'; then
     echo "Cross-built daemon is not statically linked: $binary_path" >&2
     exit 1
 fi
 
-remote_stage=$(ssh -- "$remote_host" 'mktemp -d /tmp/s3-display-install.XXXXXX')
-if [[ ! "$remote_stage" =~ ^/tmp/s3-display-install\.[A-Za-z0-9]+$ ]]; then
+remote_stage=$(ssh -- "$remote_host" 'mktemp -d /tmp/health-stick-install.XXXXXX')
+if [[ ! "$remote_stage" =~ ^/tmp/health-stick-install\.[A-Za-z0-9]+$ ]]; then
     echo "The server returned an unexpected temporary path: $remote_stage" >&2
     exit 1
 fi
 
 echo "Uploading the static daemon and service files..."
 scp -- "$binary_path" "$script_dir/install-on-host.sh" \
-    "$script_dir/99-m5stick-s3.rules" "$script_dir/s3-display.service" \
+    "$script_dir/99-health-stick.rules" "$script_dir/health-stick.service" "$script_dir/health-stick.yaml" \
     "$remote_host:$remote_stage/"
 
 # A TTY lets sudo ask for the remote user's password when root SSH is disabled.

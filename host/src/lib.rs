@@ -1,6 +1,6 @@
 use std::{fs, io::Write, process::Command, thread, time::Duration};
 
-use s3_display_protocol::{
+use health_stick_protocol::{
     ButtonAction, DeviceMessage, HostMessage, MAX_FRAME_LEN, ShutdownFailure, ShutdownPhase,
     encode_host,
 };
@@ -202,13 +202,16 @@ impl<S: Shutdown> EventHandler<S> {
     /// Returns an error if the acknowledgement cannot be sent or shutdown fails.
     pub fn handle(
         &mut self,
-        message: DeviceMessage,
+        message: &DeviceMessage,
         output: &mut impl Write,
     ) -> anyhow::Result<bool> {
         match message {
             DeviceMessage::Ready => {
                 eprintln!("display connected");
                 self.session_established = false;
+                Ok(false)
+            }
+            DeviceMessage::Hello { .. } | DeviceMessage::Button(ButtonAction::NextScreen) => {
                 Ok(false)
             }
             DeviceMessage::Ack { sequence } => {
@@ -218,7 +221,6 @@ impl<S: Shutdown> EventHandler<S> {
                 }
                 Ok(false)
             }
-            DeviceMessage::Button(ButtonAction::NextScreen) => Ok(false),
             DeviceMessage::Button(ButtonAction::ShutdownRequested) if self.allow_shutdown => {
                 write_host_message(HostMessage::ShutdownAccepted, output)?;
                 output.flush()?;
@@ -274,7 +276,7 @@ mod tests {
         assert!(
             !handler
                 .handle(
-                    DeviceMessage::Button(ButtonAction::ShutdownRequested),
+                    &DeviceMessage::Button(ButtonAction::ShutdownRequested),
                     &mut output
                 )
                 .unwrap()
@@ -290,13 +292,13 @@ mod tests {
         assert!(
             handler
                 .handle(
-                    DeviceMessage::Button(ButtonAction::ShutdownRequested),
+                    &DeviceMessage::Button(ButtonAction::ShutdownRequested),
                     &mut output
                 )
                 .unwrap()
         );
         assert_eq!(
-            s3_display_protocol::decode_host(&mut output),
+            health_stick_protocol::decode_host(&mut output),
             Ok(HostMessage::ShutdownAccepted)
         );
         assert_eq!(handler.shutdown.calls, 1);

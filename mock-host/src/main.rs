@@ -6,9 +6,9 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
-use s3_display_host::{EventHandler, write_host_message};
-use s3_display_mock_host::{ConsoleShutdown, made_up_health};
-use s3_display_protocol::{
+use health_stick_host::{EventHandler, write_host_message};
+use health_stick_mock_host::{ConsoleShutdown, made_up_health};
+use health_stick_protocol::{
     FrameDecoder, HostMessage, MAX_FRAME_LEN, Sequence, UnixSeconds, decode_device,
 };
 use serialport::{SerialPortInfo, SerialPortType};
@@ -70,8 +70,11 @@ fn main() -> Result<()> {
                         continue;
                     };
                     match frame.and_then(decode_device) {
-                        Ok(message) if handler.handle(message, &mut port)? => return Ok(()),
-                        Ok(_) => {}
+                        Ok(message) => {
+                            if handler.handle(&message, &mut port)? {
+                                return Ok(());
+                            }
+                        }
                         Err(error) => eprintln!("discarding malformed device message: {error}"),
                     }
                 }

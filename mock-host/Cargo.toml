@@ -1,5 +1,5 @@
 [package]
-name = "s3-display-mock-host"
+name = "health-stick-mock-host"
 description = "Portable mock host for testing the M5Stick S3 server display"
 edition.workspace = true
 license.workspace = true
@@ -9,8 +9,8 @@ version.workspace = true
 anyhow = "1.0.102"
 clap = { version = "4.6.0", features = ["derive"] }
 serialport = { version = "4.8.1", default-features = false }
-s3-display-host = { path = "../host" }
-s3-display-protocol = { path = "../protocol" }
+health-stick-host = { path = "../host" }
+health-stick-protocol = { path = "../protocol" }
 
 [lints]
 workspace = true

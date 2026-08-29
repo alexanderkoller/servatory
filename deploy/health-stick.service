@@ -1,5 +1,5 @@
 [Unit]
-Description=M5Stick S3 Proxmox health display
+Description=Health Stick server health display
 # Keep reporting while Proxmox's native guest shutdown service runs. Shutdown
 # ordering is the reverse of startup ordering, so pve-guests stops first.
 Before=pve-guests.service
@@ -7,7 +7,7 @@ After=pve-cluster.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/s3-display-host --device /dev/m5stick-s3 --allow-shutdown --ups eaton@localhost --smart-device ROOT=/dev/sda --smart-device HDD=/dev/sdb --smart-device BACKUP=/dev/sdc --smart-device SDD=/dev/sdd --smart-device SDE=/dev/sde
+ExecStart=/usr/local/bin/health-stick-host --config /etc/health-stick/config.yaml
 Restart=on-failure
 RestartSec=2s
 NoNewPrivileges=true

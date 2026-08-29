@@ -1,10 +1,10 @@
-# M5Stick S3 Proxmox display
+# Health Stick
 
 This repository contains a tiny USB-connected Proxmox health display. Its
-240x135 landscape Split View shows an overview followed by resources,
-filesystems/SMART, UPS/Ethernet, and two guest-list screens.
+240x135 landscape display shows configurable health, resource, storage, power,
+network, and guest views.
 
-- `firmware/`: allocation-free Rust firmware for the M5Stick S3 (ESP32-S3).
+- `firmware/`: Rust firmware for the M5Stick S3 (ESP32-S3), with a heap for dynamic manifests and snapshots.
 - `host/`: Linux daemon that sends regular updates and handles button events.
 - `mock-host/`: portable test daemon with deterministic made-up guests and safe shutdown.
 - `protocol/`: versioned, typed binary protocol shared by both sides.
@@ -22,9 +22,12 @@ session. All USB transmission is non-blocking, and shutdown requests are never
 queued across disconnected sessions. After an accepted shutdown, the first
 valid update from the rebooted host returns the display to its normal status.
 
-The front button changes between six health screens on a short press. The two
-guest screens expose all eight entries supported by the protocol. Holding it
-for three seconds during a live daemon session sends a shutdown request. The host
+The front button changes between configured health screens immediately on a
+short press. A second press within 200 ms opens a persistent ABOUT screen with
+firmware, daemon, and protocol versions; one short press returns to the normal
+display. ABOUT never closes on a timer.
+Guest-list views are paginated over every guest supplied by the daemon. The
+configured long press during a live daemon session sends a shutdown request. The host
 acknowledges that request and immediately queues `/usr/bin/systemctl poweroff`.
 The daemon remains alive while Proxmox's native `pve-guests` service shuts down
 the guests, reporting the live number remaining. The display then animates the
@@ -45,6 +48,9 @@ espup install
 ```
 
 After `espup install`, load the environment file it prints in new shells. The
+current generic Xtensa linker also needs `XTENSA_GNU_CONFIG` to name its ESP32-S3
+configuration on macOS; `deploy/flash-remote-firmware.sh` derives and exports it
+automatically from the compiler installation. The
 firmware pins follow M5Stack's StickS3 map. The LCD controller RAM offsets
 (`52, 40`) are the only bring-up assumption that should be confirmed on hardware.
 
@@ -53,7 +59,7 @@ firmware pins follow M5Stack's StickS3 map. The LCD controller RAM offsets
 ```sh
 # Host and shared protocol
 cargo test --workspace
-cargo build --release -p s3-display-host
+cargo build --release -p health-stick-host
 
 # Firmware (uses firmware/.cargo/config.toml and the `esp` toolchain)
 cd firmware
@@ -77,7 +83,7 @@ use the deployment script with a regular SSH account:
 The script builds the firmware on the Mac, downloads and verifies the official
 Linux `espflash` release, and uploads both to a temporary directory. On Proxmox,
 it temporarily stops and runtime-masks the display service so it cannot seize the
-USB device during resets, flashes `/dev/m5stick-s3`, restores the service, and
+USB device during resets, flashes `/dev/health-stick`, restores the service, and
 removes the temporary files. Rust and `espflash` are not installed on the server.
 
 For the first flash from the factory UiFlow2 firmware, manually enter download
@@ -90,7 +96,7 @@ strategy exits native USB download mode and boots the application.
 Identify the device (usually `/dev/ttyACM0` before installing the udev rule):
 
 ```sh
-cargo run --release -p s3-display-host -- --device /dev/ttyACM0
+cargo run --release -p health-stick-host -- --config deploy/health-stick.yaml
 ```
 
 Add `--allow-shutdown` only when you are ready to test the long-press path.
@@ -101,14 +107,14 @@ The mock host runs on macOS, Linux, or Windows. It auto-detects the StickS3 when
 exactly one matching ESP32-S3 USB Serial/JTAG device is connected:
 
 ```sh
-cargo run -p s3-display-mock-host
+cargo run -p health-stick-mock-host
 ```
 
 If auto-detection is ambiguous, select the serial device explicitly (for example,
 `/dev/cu.usbmodem...` on macOS):
 
 ```sh
-cargo run -p s3-display-mock-host -- --device /dev/cu.usbmodem1101
+cargo run -p health-stick-mock-host -- --device /dev/cu.usbmodem1101
 ```
 
 It repeatedly sends a deterministic health snapshot with fake host metrics, VMs,
@@ -149,13 +155,14 @@ disconnect without exiting.
 To check it later:
 
 ```sh
-ssh alex@pve.local systemctl status s3-display.service
+ssh alex@pve.local systemctl status health-stick.service
 ```
 
-The installed service queries the local NUT server as `eaton@localhost` and
-monitors `/dev/sda` through `/dev/sde` with the display labels `ROOT`, `HDD`,
-`BACKUP`, `SDD`, and `SDE`. Adjust the `--ups` and repeated `--smart-device`
-arguments in `deploy/s3-display.service` when deploying to a different host.
+The installed service reads `/etc/health-stick/config.yaml`. The installer
+creates this file from `deploy/health-stick.yaml` only when it does not already
+exist, so upgrades preserve local changes. The supplied configuration queries
+the local NUT server as `eaton@localhost` and monitors `/dev/sda` through
+`/dev/sde` with the display labels `ROOT`, `HDD`, `BACKUP`, `SDD`, and `SDE`.
 UPS access is status-only and anonymous; the daemon never uses NUT control or
 shutdown credentials. SMART collection requires `smartctl` with JSON support
 and uses `-n standby`, so a health update does not wake a sleeping disk.
@@ -166,13 +173,15 @@ If you already have the matching static Linux binary, copy it to the Proxmox
 machine along with `deploy/`, then install it without any server-side build:
 
 ```sh
-sudo install -m 0755 s3-display-host /usr/local/bin/
-sudo install -m 0644 deploy/99-m5stick-s3.rules /etc/udev/rules.d/
-sudo install -m 0644 deploy/s3-display.service /etc/systemd/system/
+sudo install -m 0755 health-stick-host /usr/local/bin/
+sudo install -d -m 0755 /etc/health-stick
+sudo install -m 0644 deploy/health-stick.yaml /etc/health-stick/config.yaml
+sudo install -m 0644 deploy/99-health-stick.rules /etc/udev/rules.d/
+sudo install -m 0644 deploy/health-stick.service /etc/systemd/system/
 sudo udevadm control --reload
 sudo udevadm trigger
 sudo systemctl daemon-reload
-sudo systemctl enable --now s3-display.service
+sudo systemctl enable --now health-stick.service
 ```
 
 The udev rule matches Espressif's standard USB Serial/JTAG VID/PID. If the server
@@ -180,7 +189,7 @@ has multiple matching boards, extend the rule with the StickS3's serial number.
 
 ## Health data
 
-Every update contains a fixed-size health snapshot. The production daemon reads
+Every update contains a dynamically sized health snapshot. The production daemon reads
 CPU, memory, load, uptime, and I/O pressure from `/proc`, plus usage and available
 space for `/`, `/mnt/pve/hdd`, and `/mnt/pve/backup` from `df`. For networking,
 it identifies the interface and source address used by the
@@ -196,7 +205,8 @@ are warnings; low battery, replace-battery, and output-off states are critical.
 Two consecutive query failures produce an unavailable warning, while the first
 failure retains the last values as stale.
 
-SMART health is collected for up to five explicitly named disks. Each row shows
+SMART health is collected for the explicitly named disks. Storage and SMART
+views are paginated as needed. Each row shows
 the human-readable label, health state, and temperature when available. Sleeping
 disks are neutral, unknown or degraded results are warnings, and a failed SMART
 self-assessment is critical.
@@ -210,19 +220,51 @@ the detail screen then shows the elapsed time since the last successful probe.
 Backup health comes from enabled jobs returned by `pvesh get /cluster/backup`
 and recent `vzdump` task history. A failed latest task, a missing job, or a last
 successful backup older than 24 hours produces a warning. Guest state comes from
-`pvesh get /cluster/resources --type vm` and is bounded to eight entries on the
-display.
+`pvesh get /cluster/resources --type vm`; the resulting list is paginated on the
+display without a configured guest-count ceiling.
 
 The mock host sends deterministic values matching the Split View design, so all
 six pages can be exercised away from a Proxmox installation.
+
+## Configuration
+
+The production daemon requires `/etc/health-stick/config.yaml` unless another
+path is supplied with `--config`. Run `health-stick-host --check-config` before
+restarting the service after an edit. Unknown fields, duplicate identifiers,
+unsupported layouts, and display manifests exceeding the transport/device
+budget are rejected at startup.
+
+The YAML file configures collector paths and timings, stable resource IDs and
+display labels, the ordered health rules and their messages, reusable views,
+per-output view order, and shutdown interaction timing. Health rules exist only in the
+top-level `health` section and are evaluated in order; the first matching rule
+becomes the primary condition. Layouts describe structure while their children
+name the content, such as `columns: { left: ups, right: network }`.
+
+The host sends the validated LCD manifest to the Stick at session startup. An
+optional `outputs.http` section already selects and orders reusable views for a
+future on-Stick HTTP server; it is disabled in the supplied configuration.
+Wi-Fi credentials are intentionally outside this configuration model and will
+be provisioned only into the Stick's persistent memory. The future HTTP output
+will consume the same measurements and single centrally evaluated health result.
 
 ## Wire protocol
 
 Both sides import the same Rust `HostMessage` and `DeviceMessage` enums from the
 `no_std` protocol crate. Messages are serialized with Postcard and framed with
-COBS using a zero-byte delimiter. Receive buffers are statically bounded, and a
-versioned envelope rejects incompatible schemas. Within one protocol version,
-enum variants are append-only and must not be reordered.
+COBS using a zero-byte delimiter. A magic-and-version prefix precedes the encoded body, so a
+receiver rejects an incompatible protocol before attempting to decode a schema
+it may not understand. The overall frame budget is 16 KiB; collection counts and
+text fields are heap-backed and have no separate firmware maxima. The firmware
+reserves a 64 KiB heap for decoded manifests and snapshots.
 
-The current health snapshot is allocation-free on the device and remains within
-the protocol's fixed 512-byte frame buffer, including the maximum guest list.
+The daemon sends `Hello` immediately after opening the serial device and retries
+until the Stick answers with its own version-compatible `Hello`. The Stick also
+announces itself at boot and once per second while it has no live session. This
+covers either side starting first, USB removal/reinsertion, daemon restarts, and
+firmware resets that leave the serial port open. A fresh Stick `Hello` makes the
+daemon resend the display manifest and a fresh daemon `Hello` resets the Stick's
+session. Exact version mismatches are logged by the daemon and shown as an
+upgrade-required state on the Stick; a silent peer produces a diagnostic after
+five seconds while retries continue. Compatible Hello messages also exchange
+the daemon and firmware package versions used by the ABOUT screen.

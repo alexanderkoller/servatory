@@ -1,0 +1,214 @@
+version: 1
+
+host:
+  update_interval: 5s
+
+connection:
+  usb_serial:
+    device: /dev/health-stick
+    reconnect_interval: 1s
+
+actions:
+  shutdown:
+    enabled: true
+    hold_time: 3s
+    animation_delay: 200ms
+
+sources:
+  system:
+    provider: procfs
+
+  filesystems:
+    - id: root
+      path: /
+      label: "/"
+    - id: hdd
+      path: /mnt/pve/hdd
+      label: HDD
+    - id: backup
+      path: /mnt/pve/backup
+      label: BACKUP
+
+  smart:
+    devices:
+      - { id: root, path: /dev/sda, label: ROOT }
+      - { id: hdd, path: /dev/sdb, label: HDD }
+      - { id: backup, path: /dev/sdc, label: BACKUP }
+      - { id: sdd, path: /dev/sdd, label: SDD }
+      - { id: sde, path: /dev/sde, label: SDE }
+
+  ups:
+    endpoint: eaton@localhost
+    failures_before_unavailable: 2
+
+  network:
+    interface: default_ipv4_route
+    resolve_physical_interface: true
+
+  internet:
+    target: www.google.de
+    interval: 30s
+    timeout: 4s
+    link_up_settle_delay: 3s
+    first_failure_retry_delay: 5s
+    failures_before_failed: 2
+
+  proxmox:
+    node: local_hostname
+    backup:
+      task_history_limit: 50
+
+health:
+  default: { severity: healthy, message: HEALTHY }
+  rules:
+    - id: ups_low_battery
+      severity: critical
+      when: { measurement: ups.main.status, equals: low_battery }
+      message: UPS LOW BATTERY
+    - id: ups_output_off
+      severity: critical
+      when: { measurement: ups.main.status, equals: output_off }
+      message: UPS OUTPUT OFF
+    - id: ups_replace_battery
+      severity: critical
+      when: { measurement: ups.main.status, equals: replace_battery }
+      message: UPS REPLACE BAT
+    - id: smart_failed
+      severity: critical
+      when:
+        any:
+          - { measurement: smart.*.status, equals: failed }
+      message: SMART FAILED
+    - id: link_down
+      severity: critical
+      when: { measurement: network.uplink.up, equals: false }
+      message: LINK DOWN
+    - id: internet_failed
+      severity: critical
+      when: { measurement: network.internet.status, equals: failed }
+      message: PING FAILED
+    - id: root_missing
+      severity: critical
+      when: { measurement: filesystem.root.mounted, equals: false }
+      message: "{filesystem.root.label} MISSING"
+    - id: root_full
+      severity: critical
+      when: { measurement: filesystem.root.used_percent, greater_than: 90 }
+      message: "{filesystem.root.label} {value}% FULL"
+    - id: hdd_missing
+      severity: critical
+      when: { measurement: filesystem.hdd.mounted, equals: false }
+      message: "{filesystem.hdd.label} MISSING"
+    - id: hdd_full
+      severity: critical
+      when: { measurement: filesystem.hdd.used_percent, greater_than: 90 }
+      message: "{filesystem.hdd.label} {value}% FULL"
+    - id: backup_storage_missing
+      severity: critical
+      when: { measurement: filesystem.backup.mounted, equals: false }
+      message: "{filesystem.backup.label} MISSING"
+    - id: backup_storage_full
+      severity: critical
+      when: { measurement: filesystem.backup.used_percent, greater_than: 90 }
+      message: "{filesystem.backup.label} {value}% FULL"
+    - id: backup_unknown
+      severity: critical
+      when: { measurement: proxmox.backup.status, equals: unknown }
+      message: BACKUP UNKNOWN
+    - id: ups_on_battery
+      severity: warning
+      when: { measurement: ups.main.status, equals: on_battery }
+      message: UPS ON BATTERY
+    - id: ups_bypass
+      severity: warning
+      when: { measurement: ups.main.status, equals: bypass }
+      message: UPS BYPASS
+    - id: ups_unavailable
+      severity: warning
+      when:
+        any:
+          - { measurement: ups.main.status, equals: unavailable }
+          - all:
+              - { measurement: ups.main.status, equals: unknown }
+              - { measurement: ups.main.stale, equals: false }
+      message: UPS UNAVAILABLE
+    - id: smart_warning
+      severity: warning
+      when:
+        any:
+          - { measurement: smart.*.status, in: [warning, unknown] }
+      message: SMART WARNING
+    - id: cpu_high
+      severity: warning
+      when: { measurement: system.cpu.percent, at_least: 85 }
+      message: "CPU {value}%"
+    - id: memory_high
+      severity: warning
+      when: { measurement: system.memory.used_percent, at_least: 90 }
+      message: "MEMORY {value}%"
+    - id: io_pressure_high
+      severity: warning
+      when: { measurement: system.io_pressure.percent, at_least: 50 }
+      message: "IO PRESS {value}%"
+    - id: backup_no_job
+      severity: warning
+      when: { measurement: proxmox.backup.status, equals: no_job }
+      message: BACKUP NO JOB
+    - id: backup_failed
+      severity: warning
+      when: { measurement: proxmox.backup.status, equals: failed }
+      message: BACKUP FAILED
+    - id: backup_stale
+      severity: warning
+      when: { measurement: proxmox.backup.status, equals: stale }
+      message: BACKUP OVERDUE
+    - id: backup_healthy_but_overdue
+      severity: warning
+      when:
+        all:
+          - { measurement: proxmox.backup.status, equals: healthy }
+          - { measurement: proxmox.backup.last_success_age, missing_or_greater_than: 24h }
+      message: BACKUP OVERDUE
+    - id: backup_running_without_recent_success
+      severity: warning
+      when:
+        all:
+          - { measurement: proxmox.backup.status, equals: running }
+          - { measurement: proxmox.backup.last_success_age, missing_or_greater_than: 24h }
+      message: BACKUP OVERDUE
+
+views:
+  overview:
+    title: OVERVIEW
+    layout:
+      columns:
+        left: health
+        right: { rows: [host_summary, network_summary, guest_summary] }
+  resources:
+    title: RESOURCES
+    layout:
+      grid: { columns: 2, children: [cpu, memory, io_pressure, load_average] }
+  storage:
+    title: STORAGE + SMART
+    layout:
+      columns:
+        left: { filesystems: [root, hdd, backup], footer: proxmox_backup }
+        right: { smart: [root, hdd, backup, sdd, sde] }
+  power_network:
+    title: UPS + ETHERNET
+    layout:
+      columns: { left: ups, right: network }
+  guests:
+    title: GUESTS
+    layout:
+      single: { guest_list: { paginate: true } }
+
+outputs:
+  stick:
+    lcd:
+      views: [overview, resources, storage, power_network, guests]
+  # Reserved for the future on-stick Wi-Fi HTTP server. Credentials are not
+  # part of this file; they will be provisioned in the Stick's persistent memory.
+  http:
+    enabled: false
+    views: [overview, resources, storage, power_network, guests]

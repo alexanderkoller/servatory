@@ -1,7 +1,7 @@
 use std::{io::Write, thread, time::Duration};
 
-use s3_display_host::Shutdown;
-use s3_display_protocol::{
+use health_stick_host::Shutdown;
+use health_stick_protocol::{
     BackupJobStatus, FilesystemUsage, GuestKind, GuestSnapshot, GuestStatus, GuestSummary,
     HealthSnapshot, InternetStatus, SmartDeviceSummary, SmartSnapshot, SmartStatus, UpsSnapshot,
     UpsStatus,
@@ -27,8 +27,8 @@ impl<W> ConsoleShutdown<W> {
 
 impl<W: Write> Shutdown for ConsoleShutdown<W> {
     fn poweroff(&mut self, output: &mut impl Write) -> anyhow::Result<()> {
-        use s3_display_host::write_host_message;
-        use s3_display_protocol::{HostMessage, ShutdownPhase};
+        use health_stick_host::write_host_message;
+        use health_stick_protocol::{HostMessage, ShutdownPhase};
 
         for (phase, remaining) in [
             (ShutdownPhase::PreparingGuests, 4),
@@ -108,14 +108,10 @@ pub fn made_up_guests() -> GuestSnapshot {
             4_096,
         ),
     ];
-    GuestSnapshot::from_slice(&guests)
+    GuestSnapshot::new(guests.into())
 }
 
 /// Returns deterministic host data matching the landscape Split View mockup.
-///
-/// # Panics
-///
-/// Panics only if the built-in host name exceeds the protocol's fixed limit.
 #[must_use]
 pub fn made_up_health() -> HealthSnapshot {
     HealthSnapshot::new(
@@ -126,9 +122,11 @@ pub fn made_up_health() -> HealthSnapshot {
         32_768,
         4,
         82,
-        FilesystemUsage::new(6, 85 * 1_024),
-        FilesystemUsage::new(33, 6_186_598),
-        FilesystemUsage::new(60, 3_670_016),
+        vec![
+            FilesystemUsage::new(6, 85 * 1_024),
+            FilesystemUsage::new(33, 6_186_598),
+            FilesystemUsage::new(60, 3_670_016),
+        ],
         BackupJobStatus::Healthy,
         Some(6 * 60 * 60),
         true,
@@ -146,7 +144,7 @@ pub fn made_up_health() -> HealthSnapshot {
             estimated_watts: Some(102),
             stale: false,
         },
-        SmartSnapshot::from_slice(&[
+        SmartSnapshot::new(vec![
             smart("ROOT", SmartStatus::Healthy, Some(38)),
             smart("HDD", SmartStatus::Healthy, Some(31)),
             smart("BACKUP", SmartStatus::Healthy, Some(30)),
@@ -154,12 +152,10 @@ pub fn made_up_health() -> HealthSnapshot {
             smart("SDE", SmartStatus::Sleeping, None),
         ]),
     )
-    .expect("built-in mock host name fits the protocol")
 }
 
 fn smart(label: &str, status: SmartStatus, temperature_celsius: Option<i8>) -> SmartDeviceSummary {
     SmartDeviceSummary::new(label, status, temperature_celsius)
-        .expect("built-in SMART labels fit the protocol")
 }
 
 fn guest(
@@ -180,7 +176,6 @@ fn guest(
         memory_used_mib,
         memory_total_mib,
     )
-    .expect("built-in mock guest names fit the protocol")
 }
 
 #[cfg(test)]

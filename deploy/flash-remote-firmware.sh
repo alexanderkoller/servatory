@@ -48,10 +48,20 @@ if ! rustup run esp rustc --version >/dev/null 2>&1; then
     echo "Run 'espup install', then load the environment file it creates." >&2
     exit 1
 fi
-if ! command -v xtensa-esp32s3-elf-gcc >/dev/null 2>&1; then
+if ! command -v xtensa-esp-elf-gcc >/dev/null 2>&1; then
     echo "The Espressif linker is not on PATH." >&2
     echo "Load '$espup_export' or set ESPUP_EXPORT_FILE to its location." >&2
     exit 1
+fi
+if [[ -z ${XTENSA_GNU_CONFIG:-} ]]; then
+    xtensa_compiler=$(command -v xtensa-esp-elf-gcc)
+    xtensa_root=$(cd -- "$(dirname -- "$xtensa_compiler")/.." && pwd)
+    xtensa_config=$xtensa_root/lib/xtensa_esp32s3.so
+    if [[ ! -f "$xtensa_config" ]]; then
+        echo "The ESP32-S3 Xtensa linker configuration is missing: $xtensa_config" >&2
+        exit 1
+    fi
+    export XTENSA_GNU_CONFIG=$xtensa_config
 fi
 
 ssh_options=(-o ConnectTimeout=10 -o ConnectionAttempts=1)
@@ -81,8 +91,8 @@ case "$remote_arch" in
         ;;
 esac
 
-if ! ssh "${ssh_options[@]}" -- "$remote_host" 'test -e /dev/m5stick-s3'; then
-    echo "The server does not currently expose /dev/m5stick-s3." >&2
+if ! ssh "${ssh_options[@]}" -- "$remote_host" 'test -e /dev/health-stick'; then
+    echo "The server does not currently expose /dev/health-stick." >&2
     echo "Check that the Stick is connected and the repository's udev rule is installed." >&2
     exit 1
 fi
@@ -91,7 +101,7 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_dir=$(cd -- "$script_dir/.." && pwd)
 firmware_dir=$repo_dir/firmware
 firmware_target=xtensa-esp32s3-none-elf
-firmware_binary=$firmware_dir/target/$firmware_target/release/s3-display-firmware
+firmware_binary=$firmware_dir/target/$firmware_target/release/health-stick-firmware
 
 echo "Building release firmware locally..."
 (cd "$firmware_dir" && cargo build --locked --release)
@@ -119,8 +129,8 @@ if ! file "$remote_espflash" | grep -Fq 'ELF 64-bit'; then
 fi
 
 remote_stage=$(ssh "${ssh_options[@]}" -- "$remote_host" \
-    'mktemp -d /tmp/s3-display-flash.XXXXXX')
-if [[ ! "$remote_stage" =~ ^/tmp/s3-display-flash\.[A-Za-z0-9]+$ ]]; then
+    'mktemp -d /tmp/health-stick-flash.XXXXXX')
+if [[ ! "$remote_stage" =~ ^/tmp/health-stick-flash\.[A-Za-z0-9]+$ ]]; then
     echo "The server returned an unexpected temporary path: $remote_stage" >&2
     exit 1
 fi

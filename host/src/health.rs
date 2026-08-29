@@ -8,12 +8,14 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use s3_display_protocol::{
+use health_stick_protocol::{
     BackupJobStatus, FilesystemUsage, GuestKind, GuestSnapshot, GuestStatus, GuestSummary,
-    HealthSnapshot, InternetStatus, MAX_GUEST_NAME_LEN, MAX_HOST_NAME_LEN, SmartDeviceSummary,
-    SmartSnapshot, SmartStatus, UpsSnapshot, UpsStatus,
+    HealthSnapshot, InternetStatus, SmartDeviceSummary, SmartSnapshot, SmartStatus, UpsSnapshot,
+    UpsStatus,
 };
 use serde_json::Value;
+
+use crate::config::{InternetConfig, SmartDeviceConfig};
 
 #[derive(Clone, Copy)]
 struct CpuTimes {
@@ -26,28 +28,40 @@ pub struct HealthCollector {
     connectivity: ConnectivityProbe,
     ups: UpsCollector,
     smart_devices: Vec<SmartDeviceConfig>,
+    filesystems: Vec<String>,
+    backup_task_history_limit: u16,
 }
 
 impl Default for HealthCollector {
     fn default() -> Self {
-        Self::new(None, Vec::new())
+        Self::new(
+            None,
+            2,
+            Vec::new(),
+            vec!["/".into(), "/mnt/pve/hdd".into(), "/mnt/pve/backup".into()],
+            None,
+            50,
+        )
     }
-}
-
-#[derive(Clone, Debug)]
-pub struct SmartDeviceConfig {
-    pub label: String,
-    pub path: String,
 }
 
 impl HealthCollector {
     #[must_use]
-    pub fn new(ups_target: Option<String>, smart_devices: Vec<SmartDeviceConfig>) -> Self {
+    pub fn new(
+        ups_target: Option<String>,
+        ups_failures_before_unavailable: u8,
+        smart_devices: Vec<SmartDeviceConfig>,
+        filesystems: Vec<String>,
+        internet: Option<&InternetConfig>,
+        backup_task_history_limit: u16,
+    ) -> Self {
         Self {
             previous_cpu: None,
-            connectivity: ConnectivityProbe::new(),
-            ups: UpsCollector::new(ups_target),
+            connectivity: ConnectivityProbe::new(internet),
+            ups: UpsCollector::new(ups_target, ups_failures_before_unavailable),
             smart_devices,
+            filesystems,
+            backup_task_history_limit,
         }
     }
 }
@@ -64,15 +78,18 @@ impl HealthCollector {
         let network = read_network();
         let (internet_status, last_internet_success_age_seconds) =
             self.connectivity.snapshot(network.up);
-        let root_storage = read_filesystem_usage("/");
-        let hdd_storage = read_filesystem_usage("/mnt/pve/hdd");
-        let backup_storage = read_filesystem_usage("/mnt/pve/backup");
+        let filesystems = self
+            .filesystems
+            .iter()
+            .map(|path| read_filesystem_usage(path))
+            .collect();
         let (backup_job_status, last_successful_backup_age_seconds) = read_backup_job_status(
             &host_name,
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .ok()
                 .map(|duration| duration.as_secs()),
+            self.backup_task_history_limit,
         );
         let ups = self.ups.collect();
         let smart = read_smart(&self.smart_devices);
@@ -84,9 +101,7 @@ impl HealthCollector {
             memory_total_mib,
             read_io_pressure(),
             read_load_average(),
-            root_storage,
-            hdd_storage,
-            backup_storage,
+            filesystems,
             backup_job_status,
             last_successful_backup_age_seconds,
             network.up,
@@ -99,24 +114,23 @@ impl HealthCollector {
             ups,
             smart,
         )
-        .expect("collector truncates host names to the protocol limit")
     }
 }
-
-const UPS_FAILURES_BEFORE_UNAVAILABLE: u8 = 2;
 
 struct UpsCollector {
     target: Option<String>,
     last_good: Option<UpsSnapshot>,
     consecutive_failures: u8,
+    failures_before_unavailable: u8,
 }
 
 impl UpsCollector {
-    fn new(target: Option<String>) -> Self {
+    fn new(target: Option<String>, failures_before_unavailable: u8) -> Self {
         Self {
             target,
             last_good: None,
             consecutive_failures: 0,
+            failures_before_unavailable,
         }
     }
 
@@ -149,7 +163,7 @@ impl UpsCollector {
             stale: true,
         });
         stale.stale = true;
-        if self.consecutive_failures >= UPS_FAILURES_BEFORE_UNAVAILABLE {
+        if self.consecutive_failures >= self.failures_before_unavailable {
             stale.status = UpsStatus::Unavailable;
         }
         stale
@@ -206,12 +220,12 @@ fn bounded_u16(value: f64) -> u16 {
 fn read_smart(devices: &[SmartDeviceConfig]) -> SmartSnapshot {
     let summaries: Vec<_> = devices
         .iter()
-        .filter_map(|device| {
+        .map(|device| {
             let (status, temperature) = read_smart_device(&device.path);
-            SmartDeviceSummary::new(&device.label, status, temperature).ok()
+            SmartDeviceSummary::new(&device.label, status, temperature)
         })
         .collect();
-    SmartSnapshot::from_slice(&summaries)
+    SmartSnapshot::new(summaries)
 }
 
 fn read_smart_device(path: &str) -> (SmartStatus, Option<i8>) {
@@ -276,7 +290,7 @@ fn smart_temperature(json: &Value) -> Option<i8> {
 
 fn read_host_name() -> String {
     let name = fs::read_to_string("/etc/hostname").unwrap_or_else(|_| "proxmox".into());
-    truncate_utf8(name.trim(), MAX_HOST_NAME_LEN).to_owned()
+    name.trim().to_owned()
 }
 
 fn read_uptime() -> u64 {
@@ -389,11 +403,10 @@ fn parse_filesystem_usage(output: &str, expected_mount: &str) -> Option<Filesyst
     ))
 }
 
-const BACKUP_MAX_AGE_SECONDS: u64 = 24 * 60 * 60;
-
 fn read_backup_job_status(
     host_name: &str,
     now_seconds: Option<u64>,
+    task_history_limit: u16,
 ) -> (BackupJobStatus, Option<u32>) {
     let Some(now_seconds) = now_seconds else {
         return (BackupJobStatus::Unknown, None);
@@ -405,6 +418,7 @@ fn read_backup_job_status(
         return (BackupJobStatus::Unknown, None);
     };
     let task_path = format!("/nodes/{host_name}/tasks");
+    let task_history_limit = task_history_limit.to_string();
     let Ok(tasks) = Command::new("/usr/bin/pvesh")
         .args([
             "get",
@@ -414,7 +428,7 @@ fn read_backup_job_status(
             "--source",
             "all",
             "--limit",
-            "50",
+            &task_history_limit,
             "--output-format",
             "json",
         ])
@@ -480,11 +494,7 @@ fn parse_backup_job_status(
     if latest.get("status").and_then(Value::as_str) != Some("OK") {
         return (BackupJobStatus::Failed, success_age);
     }
-    if success_age.is_some_and(|age| u64::from(age) <= BACKUP_MAX_AGE_SECONDS) {
-        (BackupJobStatus::Healthy, success_age)
-    } else {
-        (BackupJobStatus::Stale, success_age)
-    }
+    (BackupJobStatus::Healthy, success_age)
 }
 
 fn backup_job_enabled(job: &Value) -> bool {
@@ -519,10 +529,31 @@ struct ProbeState {
     last_link_up: Option<bool>,
     generation: u32,
     link_up_grace_retry: bool,
+    interval: Duration,
+    settle_delay: Duration,
+    retry_delay: Duration,
+    failures_before_failed: u8,
 }
 
 impl ProbeState {
+    #[cfg(test)]
     fn new(now: Instant) -> Self {
+        Self::new_configured(
+            now,
+            CONNECTIVITY_PROBE_INTERVAL,
+            LINK_UP_SETTLE_DELAY,
+            LINK_UP_RETRY_DELAY,
+            2,
+        )
+    }
+
+    fn new_configured(
+        now: Instant,
+        interval: Duration,
+        settle_delay: Duration,
+        retry_delay: Duration,
+        failures_before_failed: u8,
+    ) -> Self {
         Self {
             status: InternetStatus::Checking,
             consecutive_failures: 0,
@@ -532,6 +563,10 @@ impl ProbeState {
             last_link_up: None,
             generation: 0,
             link_up_grace_retry: false,
+            interval,
+            settle_delay,
+            retry_delay,
+            failures_before_failed,
         }
     }
 
@@ -539,7 +574,7 @@ impl ProbeState {
         if self.last_link_up != Some(link_up) {
             self.last_link_up = Some(link_up);
             self.next_probe = if link_up {
-                now + LINK_UP_SETTLE_DELAY
+                now + self.settle_delay
             } else {
                 now
             };
@@ -552,7 +587,7 @@ impl ProbeState {
             return None;
         }
         self.in_flight = true;
-        self.next_probe = now + CONNECTIVITY_PROBE_INTERVAL;
+        self.next_probe = now + self.interval;
         Some(self.generation)
     }
 
@@ -569,10 +604,10 @@ impl ProbeState {
         } else if self.link_up_grace_retry {
             self.status = InternetStatus::Checking;
             self.link_up_grace_retry = false;
-            self.next_probe = now + LINK_UP_RETRY_DELAY;
+            self.next_probe = now + self.retry_delay;
         } else {
             self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-            self.status = if self.consecutive_failures == 1 {
+            self.status = if self.consecutive_failures < self.failures_before_failed {
                 InternetStatus::Missed
             } else {
                 InternetStatus::Failed
@@ -583,12 +618,29 @@ impl ProbeState {
 
 struct ConnectivityProbe {
     state: Arc<Mutex<ProbeState>>,
+    target: String,
+    timeout: Duration,
 }
 
 impl ConnectivityProbe {
-    fn new() -> Self {
+    fn new(config: Option<&InternetConfig>) -> Self {
+        let target =
+            config.map_or_else(|| "www.google.de".to_owned(), |value| value.target.clone());
+        let timeout = config.map_or(CONNECTIVITY_PROBE_TIMEOUT, |value| value.timeout);
+        let interval = config.map_or(CONNECTIVITY_PROBE_INTERVAL, |value| value.interval);
+        let settle = config.map_or(LINK_UP_SETTLE_DELAY, |value| value.link_up_settle_delay);
+        let retry = config.map_or(LINK_UP_RETRY_DELAY, |value| value.first_failure_retry_delay);
+        let failures = config.map_or(2, |value| value.failures_before_failed);
         Self {
-            state: Arc::new(Mutex::new(ProbeState::new(Instant::now()))),
+            state: Arc::new(Mutex::new(ProbeState::new_configured(
+                Instant::now(),
+                interval,
+                settle,
+                retry,
+                failures,
+            ))),
+            target,
+            timeout,
         }
     }
 
@@ -600,10 +652,12 @@ impl ConnectivityProbe {
             .map_or(None, |mut state| state.prepare_probe(now, link_up));
         if let Some(probe_generation) = probe_generation {
             let shared = Arc::clone(&self.state);
+            let target = self.target.clone();
+            let timeout = self.timeout;
             if thread::Builder::new()
                 .name("internet-probe".into())
                 .spawn(move || {
-                    let reachable = ping_google();
+                    let reachable = ping_target(&target, timeout);
                     if let Ok(mut state) = shared.lock() {
                         state.record_result(probe_generation, reachable, Instant::now());
                     }
@@ -626,9 +680,9 @@ impl ConnectivityProbe {
     }
 }
 
-fn ping_google() -> bool {
+fn ping_target(target: &str, timeout: Duration) -> bool {
     let Ok(mut child) = Command::new("/usr/bin/ping")
-        .args(["-4", "-n", "-c", "1", "-W", "2", "www.google.de"])
+        .args(["-4", "-n", "-c", "1", "-W", "2", target])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -636,7 +690,7 @@ fn ping_google() -> bool {
     else {
         return false;
     };
-    let deadline = Instant::now() + CONNECTIVITY_PROBE_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return status.success(),
@@ -831,17 +885,17 @@ fn read_guests(host_name: &str) -> GuestSnapshot {
         ])
         .output()
     else {
-        return GuestSnapshot::EMPTY;
+        return GuestSnapshot::default();
     };
     if !output.status.success() {
-        return GuestSnapshot::EMPTY;
+        return GuestSnapshot::default();
     }
     parse_guests(&output.stdout, host_name)
 }
 
 fn parse_guests(bytes: &[u8], host_name: &str) -> GuestSnapshot {
     let Ok(Value::Array(values)) = serde_json::from_slice(bytes) else {
-        return GuestSnapshot::EMPTY;
+        return GuestSnapshot::default();
     };
     let guests: Vec<_> = values
         .iter()
@@ -853,7 +907,7 @@ fn parse_guests(bytes: &[u8], host_name: &str) -> GuestSnapshot {
         })
         .filter_map(parse_guest)
         .collect();
-    GuestSnapshot::from_slice(&guests)
+    GuestSnapshot::new(guests)
 }
 
 fn parse_guest(value: &Value) -> Option<GuestSummary> {
@@ -879,16 +933,15 @@ fn parse_guest(value: &Value) -> Option<GuestSummary> {
         .get("name")
         .and_then(Value::as_str)
         .unwrap_or(&fallback);
-    GuestSummary::new(
+    Some(GuestSummary::new(
         vmid,
-        truncate_utf8(name, MAX_GUEST_NAME_LEN),
+        name,
         kind,
         status,
         cpu,
         memory_used_mib,
         memory_total_mib,
-    )
-    .ok()
+    ))
 }
 
 fn bytes_to_mib(bytes: u64) -> u32 {
@@ -918,14 +971,6 @@ fn parse_hundredths(value: &str) -> Option<u16> {
     .ok()
 }
 
-fn truncate_utf8(value: &str, limit: usize) -> &str {
-    let mut end = value.len().min(limit);
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    &value[..end]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -935,7 +980,7 @@ mod tests {
     impl TempSysfs {
         fn new() -> Self {
             let path = std::env::temp_dir().join(format!(
-                "s3-display-sysfs-{}-{}",
+                "health-stick-sysfs-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1033,14 +1078,14 @@ mod tests {
     }
 
     #[test]
-    fn backup_older_than_twenty_four_hours_is_stale() {
+    fn backup_age_is_reported_without_applying_health_policy() {
         let (status, age) = parse_backup_job_status(
             br#"[{"id":"nightly"}]"#,
             br#"[{"starttime":1,"endtime":100,"status":"OK"}]"#,
             "pve-01",
             86_501,
         );
-        assert_eq!(status, BackupJobStatus::Stale);
+        assert_eq!(status, BackupJobStatus::Healthy);
         assert_eq!(age, Some(86_401));
     }
 
@@ -1153,13 +1198,5 @@ mod tests {
         assert_eq!(snapshot.guests()[0].memory_total_mib, 8_192);
         assert_eq!(snapshot.guests()[1].kind, GuestKind::Container);
         assert_eq!(snapshot.guests()[1].status, GuestStatus::Stopped);
-    }
-
-    #[test]
-    fn truncates_on_utf8_boundaries() {
-        let long = "123456789012345678é";
-        let truncated = truncate_utf8(long, MAX_GUEST_NAME_LEN);
-        assert!(truncated.len() <= MAX_GUEST_NAME_LEN);
-        assert!(truncated.is_char_boundary(truncated.len()));
     }
 }
