@@ -370,7 +370,7 @@ impl Config {
             .context("shutdown animation_delay exceeds device limit")?;
         let mut display = DisplayConfig::new(hold, delay, labels, self.compile_pages(guest_count)?)
             .map_err(|error| anyhow::anyhow!("invalid display configuration: {error}"))?;
-        display.daemon_version = SoftwareVersion::new(env!("CARGO_PKG_VERSION"));
+        display.daemon_version = SoftwareVersion::new(env!("HEALTH_STICK_BUILD_VERSION"));
         Ok(display)
     }
 

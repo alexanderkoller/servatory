@@ -1,5 +1,6 @@
 [package]
 name = "health-stick-host"
+build = "build.rs"
 description = "Linux-side USB updater for the M5Stick S3 server display"
 edition.workspace = true
 license.workspace = true

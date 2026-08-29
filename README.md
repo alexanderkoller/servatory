@@ -24,7 +24,8 @@ valid update from the rebooted host returns the display to its normal status.
 
 The front button changes between configured health screens immediately on a
 short press. A second press within 200 ms opens a persistent ABOUT screen with
-firmware, daemon, and protocol versions; one short press returns to the normal
+firmware and daemon build identifiers (package version plus Git revision) and
+the protocol version; one short press returns to the normal
 display. ABOUT never closes on a timer.
 Guest-list views are paginated over every guest supplied by the daemon. The
 configured long press during a live daemon session sends a shutdown request. The host
@@ -267,4 +268,6 @@ daemon resend the display manifest and a fresh daemon `Hello` resets the Stick's
 session. Exact version mismatches are logged by the daemon and shown as an
 upgrade-required state on the Stick; a silent peer produces a diagnostic after
 five seconds while retries continue. Compatible Hello messages also exchange
-the daemon and firmware package versions used by the ABOUT screen.
+the daemon and firmware build identifiers used by the ABOUT screen. These use
+the form `0.1.0+g0123456789`, with `.dirty` appended when built from a modified
+working tree and `gunknown` when Git metadata is unavailable.

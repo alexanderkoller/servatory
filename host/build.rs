@@ -51,7 +51,7 @@ fn watch_git_revision(repository: &Path) {
     );
     println!(
         "cargo:rerun-if-changed={}",
-        repository.join("firmware/src").display()
+        repository.join("host/src").display()
     );
     println!(
         "cargo:rerun-if-changed={}",

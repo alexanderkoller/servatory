@@ -109,7 +109,7 @@ fn main() -> Result<()> {
         if !handshake_established && Instant::now() >= next_hello {
             if let Err(error) = write_host_message(
                 HostMessage::Hello {
-                    daemon_version: SoftwareVersion::new(env!("CARGO_PKG_VERSION")),
+                    daemon_version: SoftwareVersion::new(env!("HEALTH_STICK_BUILD_VERSION")),
                 },
                 connected_port,
             ) {

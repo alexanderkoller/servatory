@@ -187,7 +187,7 @@ impl UsbTx {
 
 fn device_hello() -> DeviceMessage {
     DeviceMessage::Hello {
-        firmware_version: SoftwareVersion::new(env!("CARGO_PKG_VERSION")),
+        firmware_version: SoftwareVersion::new(env!("HEALTH_STICK_BUILD_VERSION")),
     }
 }
 
@@ -2096,7 +2096,7 @@ where
         .ok();
 
     let mut firmware = String::<40>::new();
-    let _ = write!(firmware, "FIRMWARE  {}", env!("CARGO_PKG_VERSION"));
+    let _ = write!(firmware, "FIRMWARE  {}", env!("HEALTH_STICK_BUILD_VERSION"));
     Text::new(&firmware, Point::new(18, 58), body)
         .draw(display)
         .ok();

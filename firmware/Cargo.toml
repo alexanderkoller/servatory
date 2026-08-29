@@ -1,5 +1,6 @@
 [package]
 name = "health-stick-firmware"
+build = "build.rs"
 description = "M5Stick S3 firmware for a USB-connected server display"
 edition = "2024"
 license = "MIT OR Apache-2.0"
