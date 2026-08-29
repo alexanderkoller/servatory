@@ -38,12 +38,25 @@ answers mDNS queries for the hostname selected during provisioning. If the
 network filters multicast DNS, use the IP address assigned to the stick by the
 router instead.
 
-The page follows the view order under `outputs.http.views`. It presents the same
-information as the LCD, but combines paginated disks and guests into continuous
-sections. It adds only the information needed to interpret a remote snapshot:
-whether the feed is live, its age, and the complete active-incident list. The
-page refreshes every five seconds and does not load scripts, fonts, libraries,
-or other assets from the Internet.
+The responsive dashboard follows the view order under `outputs.http.views`.
+It presents the same information as the LCD, but combines paginated disks and
+guests into continuous sections and uses compact utilization bars for resources.
+An About card shows the firmware, daemon, protocol, hostname, and the stick's
+current DHCP address. A Notifications card shows the configured ntfy server and
+topic, provides a copy button, can send a test notification, and can generate a
+new random topic. Topic generation writes the replacement to flash immediately
+and switches subsequent notifications without Wi-Fi reprovisioning. Existing
+ntfy subscriptions must be changed to the newly displayed topic. The page also
+shows whether the feed is live, its age, and the complete active-incident list.
+It refreshes every five seconds and does not load scripts, fonts, libraries, or
+other assets from the Internet.
+
+When the HTTP server is enabled and DHCP has assigned an address, the Stick's
+About screen shows a QR code for the dashboard root URL. The adjacent LCD text
+uses short semantic versions to leave the code a reliable three display pixels
+per module; the web About card retains the complete build identifiers. If HTTP
+is disabled or no address is available, the LCD uses the detailed text-only
+About screen instead.
 
 The stick also serves four machine-readable routes:
 

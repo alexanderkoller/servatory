@@ -38,6 +38,7 @@ use mipidsi::{
     models::ST7789,
     options::{ColorInversion, Orientation, Rotation},
 };
+use qrcodegen_no_heap::{QrCode, QrCodeEcc, Version};
 use servatory_protocol::{
     BackupJobStatus, ButtonAction, DeviceMessage, DisplayConfig, DisplayPage, FilesystemUsage,
     FrameDecoder, GuestKind, GuestStatus, HandshakeNonce, HealthLevel, HealthSnapshot, HostMessage,
@@ -395,6 +396,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                     daemon = DaemonState::Waiting;
                     last_update = None;
                     daemon_session = Some(session);
+                    network::update_daemon_version(daemon_version.clone()).await;
                     display_config.daemon_version = daemon_version;
                     usb_tx.enqueue(device_hello(daemon_session));
                     if !shutdown_animation_active {
@@ -2124,6 +2126,141 @@ fn draw_about<D>(display: &mut D, display_config: &DisplayConfig, color: Rgb565)
 where
     D: DrawTarget<Color = Rgb565>,
 {
+    if let (Some(ipv4), Some(port)) = (network::station_ipv4(), network::web_server_port()) {
+        let mut url = String::<40>::new();
+        if port == 80 {
+            let _ = write!(url, "http://{ipv4}/");
+        } else {
+            let _ = write!(url, "http://{ipv4}:{port}/");
+        }
+        if draw_qr_about(display, display_config, color, ipv4, &url) {
+            return;
+        }
+    }
+    draw_detailed_about(display, display_config, color);
+}
+
+fn draw_qr_about<D>(
+    display: &mut D,
+    display_config: &DisplayConfig,
+    color: Rgb565,
+    ipv4: core::net::Ipv4Addr,
+    url: &str,
+) -> bool
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    const MIN_VERSION: Version = Version::new(2);
+    const MAX_VERSION: Version = Version::new(3);
+    let mut temporary = [0_u8; MAX_VERSION.buffer_len()];
+    let mut output = [0_u8; MAX_VERSION.buffer_len()];
+    let Ok(code) = QrCode::encode_text(
+        url,
+        &mut temporary,
+        &mut output,
+        QrCodeEcc::Medium,
+        MIN_VERSION,
+        MAX_VERSION,
+        None,
+        false,
+    ) else {
+        return false;
+    };
+
+    let heading = MonoTextStyle::new(&FONT_10X20, color);
+    let body = MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE);
+    let muted = MonoTextStyle::new(&FONT_6X10, Rgb565::new(12, 28, 20));
+    draw_card(display, Point::new(8, 10), Size::new(224, 116));
+    Text::new("ABOUT", Point::new(16, 31), heading)
+        .draw(display)
+        .ok();
+
+    let mut firmware = String::<24>::new();
+    let _ = write!(firmware, "FW    {}", env!("CARGO_PKG_VERSION"));
+    Text::new(&firmware, Point::new(16, 51), body)
+        .draw(display)
+        .ok();
+    let mut daemon = String::<24>::new();
+    let _ = write!(
+        daemon,
+        "HOST  {}",
+        short_version(display_config.daemon_version.as_str())
+    );
+    Text::new(&daemon, Point::new(16, 67), body)
+        .draw(display)
+        .ok();
+    let mut protocol = String::<16>::new();
+    let _ = write!(protocol, "PROTO {PROTOCOL_VERSION}");
+    Text::new(&protocol, Point::new(16, 83), body)
+        .draw(display)
+        .ok();
+    Text::new("IP", Point::new(16, 98), muted)
+        .draw(display)
+        .ok();
+    let mut address = String::<20>::new();
+    let _ = write!(address, "{ipv4}");
+    Text::new(&address, Point::new(16, 110), body)
+        .draw(display)
+        .ok();
+    Text::new("SCAN TO OPEN", Point::new(16, 122), muted)
+        .draw(display)
+        .ok();
+
+    draw_qr(display, &code);
+    true
+}
+
+fn draw_qr<D>(display: &mut D, code: &QrCode<'_>)
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    const SCALE: i32 = 3;
+    const SCALE_U32: u32 = 3;
+    const QUIET_ZONE: i32 = 4;
+    let total = (code.size() + QUIET_ZONE * 2) * SCALE;
+    let origin = Point::new(232 - total, 12);
+    Rectangle::new(
+        origin,
+        Size::new(
+            u32::try_from(total).unwrap_or_default(),
+            u32::try_from(total).unwrap_or_default(),
+        ),
+    )
+    .into_styled(
+        PrimitiveStyleBuilder::new()
+            .fill_color(Rgb565::WHITE)
+            .build(),
+    )
+    .draw(display)
+    .ok();
+    let module = PrimitiveStyleBuilder::new()
+        .fill_color(Rgb565::BLACK)
+        .build();
+    for y in 0..code.size() {
+        for x in 0..code.size() {
+            if code.get_module(x, y) {
+                Rectangle::new(
+                    origin + Point::new((x + QUIET_ZONE) * SCALE, (y + QUIET_ZONE) * SCALE),
+                    Size::new(SCALE_U32, SCALE_U32),
+                )
+                .into_styled(module)
+                .draw(display)
+                .ok();
+            }
+        }
+    }
+}
+
+fn short_version(version: &str) -> &str {
+    version
+        .split_once('+')
+        .map_or(version, |(semantic, _)| semantic)
+}
+
+fn draw_detailed_about<D>(display: &mut D, display_config: &DisplayConfig, color: Rgb565)
+where
+    D: DrawTarget<Color = Rgb565>,
+{
     let heading = MonoTextStyle::new(&FONT_10X20, color);
     let body = MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE);
     let muted = MonoTextStyle::new(&FONT_6X10, Rgb565::new(12, 28, 20));
@@ -2134,7 +2271,7 @@ where
 
     let mut firmware = String::<40>::new();
     let _ = write!(firmware, "FIRMWARE  {}", env!("SERVATORY_BUILD_VERSION"));
-    Text::new(&firmware, Point::new(18, 58), body)
+    Text::new(&firmware, Point::new(18, 54), body)
         .draw(display)
         .ok();
     let mut daemon = String::<40>::new();
@@ -2143,15 +2280,25 @@ where
         "DAEMON    {}",
         display_config.daemon_version.as_str()
     );
-    Text::new(&daemon, Point::new(18, 76), body)
+    Text::new(&daemon, Point::new(18, 70), body)
         .draw(display)
         .ok();
     let mut protocol = String::<24>::new();
     let _ = write!(protocol, "PROTOCOL  {PROTOCOL_VERSION}");
-    Text::new(&protocol, Point::new(18, 94), body)
+    Text::new(&protocol, Point::new(18, 86), body)
         .draw(display)
         .ok();
-    Text::new("Click to return", Point::new(18, 115), muted)
+
+    let mut address = String::<32>::new();
+    if let Some(ipv4) = network::station_ipv4() {
+        let _ = write!(address, "IP        {ipv4}");
+    } else {
+        let _ = address.push_str("IP        WAITING");
+    }
+    Text::new(&address, Point::new(18, 102), body)
+        .draw(display)
+        .ok();
+    Text::new("Click to return", Point::new(18, 119), muted)
         .draw(display)
         .ok();
 }

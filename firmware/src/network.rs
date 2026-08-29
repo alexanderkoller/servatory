@@ -9,6 +9,7 @@ use core::{cell::RefCell, fmt::Write as _, net::Ipv4Addr};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use critical_section::Mutex as CriticalMutex;
 use embassy_executor::Spawner;
+use embassy_futures::select::{Either, select};
 use embassy_net::{
     IpListenEndpoint, Ipv4Cidr, Runner, Stack, StackResources, StaticConfigV4,
     dns::DnsSocket,
@@ -31,7 +32,7 @@ use reqwless::{
 };
 use servatory_protocol::{
     DisplayPage, HealthLevel, HealthSnapshot, Incident, IncidentId, NetworkConfig,
-    NotificationPriority, StickIncident,
+    NotificationPriority, PROTOCOL_VERSION, SoftwareVersion, StickIncident,
 };
 
 use crate::provisioning::{Provisioning, Store, StoredSettings};
@@ -76,6 +77,9 @@ struct SharedState {
     snapshot: Option<HealthSnapshot>,
     manifest: Option<NetworkConfig>,
     last_update: Option<Instant>,
+    station_ipv4: Option<Ipv4Addr>,
+    ntfy_topic: Option<String>,
+    daemon_version: Option<SoftwareVersion>,
 }
 
 impl SharedState {
@@ -84,13 +88,21 @@ impl SharedState {
             snapshot: None,
             manifest: None,
             last_update: None,
+            station_ipv4: None,
+            ntfy_topic: None,
+            daemon_version: None,
         }
     }
 }
 
 static STATE: Mutex<CriticalSectionRawMutex, SharedState> = Mutex::new(SharedState::new());
 static MANIFESTS: Channel<CriticalSectionRawMutex, NetworkConfig, 1> = Channel::new();
+static TOPIC_UPDATES: Channel<CriticalSectionRawMutex, String, 1> = Channel::new();
 static TEST_NOTIFICATIONS: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
+static STATION_IPV4: CriticalMutex<RefCell<Option<Ipv4Addr>>> =
+    CriticalMutex::new(RefCell::new(None));
+static WEB_SERVER_PORT: CriticalMutex<RefCell<Option<u16>>> =
+    CriticalMutex::new(RefCell::new(None));
 
 #[derive(Clone)]
 pub struct ProvisioningDisplay {
@@ -104,6 +116,24 @@ pub fn provisioning_display() -> Option<ProvisioningDisplay> {
     critical_section::with(|section| PROVISIONING_DISPLAY.borrow(section).borrow().clone())
 }
 
+pub fn station_ipv4() -> Option<Ipv4Addr> {
+    critical_section::with(|section| *STATION_IPV4.borrow(section).borrow())
+}
+
+pub fn web_server_port() -> Option<u16> {
+    critical_section::with(|section| *WEB_SERVER_PORT.borrow(section).borrow())
+}
+
+fn set_web_server(enabled: bool, port: u16) {
+    critical_section::with(|section| {
+        *WEB_SERVER_PORT.borrow(section).borrow_mut() = enabled.then_some(port);
+    });
+}
+
+pub async fn update_daemon_version(version: SoftwareVersion) {
+    STATE.lock().await.daemon_version = Some(version);
+}
+
 pub async fn update_snapshot(snapshot: HealthSnapshot) {
     let mut state = STATE.lock().await;
     state.snapshot = Some(snapshot);
@@ -111,6 +141,7 @@ pub async fn update_snapshot(snapshot: HealthSnapshot) {
 }
 
 pub async fn update_manifest(manifest: NetworkConfig) {
+    set_web_server(manifest.http.enabled, manifest.http.port);
     let mut state = STATE.lock().await;
     if state.manifest.as_ref() == Some(&manifest) {
         return;
@@ -134,18 +165,17 @@ pub async fn start(
     let rng = Rng::new();
     let seed = (rng.random() as u64) << 32 | u64::from(rng.random());
     if let Some(settings) = saved {
-        if let Some(manifest) = settings.network.clone() {
-            STATE.lock().await.manifest = Some(manifest);
+        if let Some(manifest) = settings.network.as_ref() {
+            set_web_server(manifest.http.enabled, manifest.http.port);
+        }
+        {
+            let mut state = STATE.lock().await;
+            state.manifest = settings.network.clone();
+            state.ntfy_topic = Some(settings.provisioning.ntfy_topic.clone());
         }
         start_station(spawner, wifi, store, settings, seed);
     } else {
-        let ntfy_topic = format!(
-            "servatory-{:08x}{:08x}{:08x}{:08x}",
-            rng.random(),
-            rng.random(),
-            rng.random(),
-            rng.random()
-        );
+        let ntfy_topic = random_ntfy_topic();
         start_provisioning(spawner, wifi, store, seed, ntfy_topic);
     }
 }
@@ -157,6 +187,7 @@ fn start_station(
     settings: StoredSettings,
     seed: u64,
 ) {
+    let stored_network = settings.network;
     let provisioning = settings.provisioning;
     let station = StationConfig::default()
         .with_ssid(provisioning.ssid.as_str())
@@ -180,10 +211,39 @@ fn start_station(
     );
     spawner.spawn(station_connection(controller).unwrap());
     spawner.spawn(net_task(runner).unwrap());
+    spawner.spawn(address_tracker(stack).unwrap());
     spawner.spawn(http_server(stack).unwrap());
     spawner.spawn(mdns_responder(stack, provisioning.hostname.clone()).unwrap());
-    spawner.spawn(notification_worker(stack, provisioning.ntfy_topic.clone(), seed).unwrap());
-    spawner.spawn(manifest_store(store, provisioning).unwrap());
+    spawner.spawn(notification_worker(stack, seed).unwrap());
+    spawner.spawn(manifest_store(store, provisioning, stored_network).unwrap());
+}
+
+fn random_ntfy_topic() -> String {
+    let rng = Rng::new();
+    format!(
+        "servatory-{:08x}{:08x}{:08x}{:08x}",
+        rng.random(),
+        rng.random(),
+        rng.random(),
+        rng.random()
+    )
+}
+
+#[embassy_executor::task]
+async fn address_tracker(stack: Stack<'static>) {
+    loop {
+        stack.wait_config_up().await;
+        let address = stack.config_v4().map(|config| config.address.address());
+        STATE.lock().await.station_ipv4 = address;
+        critical_section::with(|section| {
+            *STATION_IPV4.borrow(section).borrow_mut() = address;
+        });
+        stack.wait_config_down().await;
+        STATE.lock().await.station_ipv4 = None;
+        critical_section::with(|section| {
+            *STATION_IPV4.borrow(section).borrow_mut() = None;
+        });
+    }
 }
 
 fn start_provisioning(
@@ -345,10 +405,21 @@ async fn provisioning_server(stack: Stack<'static>, mut store: Store<'static>, n
 }
 
 #[embassy_executor::task]
-async fn manifest_store(mut store: Store<'static>, provisioning: Provisioning) {
+async fn manifest_store(
+    mut store: Store<'static>,
+    mut provisioning: Provisioning,
+    mut network: Option<NetworkConfig>,
+) {
     loop {
-        let manifest = MANIFESTS.receive().await;
-        let _ = store.save_network(&provisioning, manifest);
+        match select(MANIFESTS.receive(), TOPIC_UPDATES.receive()).await {
+            Either::First(manifest) => network = Some(manifest),
+            Either::Second(topic) => provisioning.ntfy_topic = topic,
+        }
+        if let Some(manifest) = network.clone() {
+            let _ = store.save_network(&provisioning, manifest);
+        } else {
+            let _ = store.save_provisioning(provisioning.clone());
+        }
     }
 }
 
@@ -448,6 +519,25 @@ async fn http_server(stack: Stack<'static>) {
         let path = request.split_whitespace().nth(1).unwrap_or("/");
         let state = STATE.lock().await.clone();
         match path {
+            "/api/v1/notifications/topic/regenerate"
+                if request.starts_with("POST ") && has_regenerate_header(request) =>
+            {
+                let topic = random_ntfy_topic();
+                STATE.lock().await.ntfy_topic = Some(topic.clone());
+                if let Err(embassy_sync::channel::TrySendError::Full(topic)) =
+                    TOPIC_UPDATES.try_send(topic)
+                {
+                    let _ = TOPIC_UPDATES.try_receive();
+                    let _ = TOPIC_UPDATES.try_send(topic);
+                }
+                write_response(
+                    &mut socket,
+                    "200 OK",
+                    "text/html; charset=utf-8",
+                    "<!doctype html><meta http-equiv=refresh content='0;url=/'><p>New ntfy topic generated and saved.</p>",
+                )
+                .await;
+            }
             "/api/v1/notifications/test" if request.starts_with("POST ") => {
                 let _ = TEST_NOTIFICATIONS.try_send(());
                 write_response(
@@ -466,9 +556,16 @@ async fn http_server(stack: Stack<'static>) {
                 let age = snapshot_age(&state)
                     .map(|age| age.as_secs())
                     .unwrap_or(u64::MAX);
+                let address = state
+                    .station_ipv4
+                    .map_or_else(|| "0.0.0.0".to_string(), |address| address.to_string());
+                let daemon = state
+                    .daemon_version
+                    .as_ref()
+                    .map_or("unknown", SoftwareVersion::as_str);
                 let body = format!(
-                    "{{\"firmware\":\"{}\",\"wifi\":\"connected\",\"snapshot_age_seconds\":{age}}}",
-                    env!("SERVATORY_BUILD_VERSION")
+                    "{{\"firmware\":\"{}\",\"daemon\":\"{daemon}\",\"protocol\":{PROTOCOL_VERSION},\"wifi\":\"connected\",\"ipv4\":\"{address}\",\"snapshot_age_seconds\":{age}}}",
+                    env!("SERVATORY_BUILD_VERSION"),
                 );
                 write_response(&mut socket, "200 OK", "application/json", &body).await;
             }
@@ -607,17 +704,6 @@ fn active_incidents(state: &SharedState) -> Vec<Incident> {
 }
 
 fn dashboard_html(state: &SharedState) -> String {
-    let mut html = String::from(
-        "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>\
-         <meta http-equiv=refresh content=5><style>:root{color-scheme:light dark}\
-         body{font:16px system-ui;margin:auto;max-width:70rem;padding:1rem;background:#10141d;color:#edf2ff}\
-         header,.card{background:#1b2230;border-radius:.65rem;padding:1rem;margin:.75rem 0}\
-         .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(18rem,1fr));gap:.75rem}\
-         .grid .card{margin:0}.ok{color:#63d69f}.warn{color:#ffd166}.crit{color:#ff6b6b}\
-         table{width:100%;border-collapse:collapse}td{padding:.3rem;border-bottom:1px solid #394257}\
-         button{padding:.55rem .8rem;border:0;border-radius:.4rem}small{color:#aab4c8}@media(prefers-color-scheme:light){body{background:#eef2f8;color:#172033}\
-         header,.card{background:white}small{color:#586174}td{border-color:#d8deea}}</style>",
-    );
     let incidents = active_incidents(state);
     let age = snapshot_age(state).map(|age| age.as_secs());
     let stale = age.is_none_or(|age| age >= HOST_STALE_AFTER.as_secs());
@@ -626,12 +712,25 @@ fn dashboard_html(state: &SharedState) -> String {
         .map(|incident| incident.level)
         .max_by_key(|level| level.priority())
         .unwrap_or(HealthLevel::Healthy);
+    let mut html = String::from(
+        "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>\
+         <meta http-equiv=refresh content=5><style>\
+         *{box-sizing:border-box}:root{color-scheme:light;--bg:#f3f6fa;--panel:#fff;--line:#dfe7ef;--muted:#68798a;--text:#152536}\
+         body{--accent:#16805d;--soft:#e6f5ef;margin:0;background:radial-gradient(circle at 92% 0,#e5f1ff 0,transparent 30rem),var(--bg);color:var(--text);font:15px ui-sans-serif,system-ui,-apple-system,sans-serif;min-height:100vh;border-top:4px solid var(--accent)}\
+         body.warn{--accent:#a86400;--soft:#fff3d6}body.crit{--accent:#c7384b;--soft:#ffeaed}.shell{width:min(74rem,100%);margin:auto;padding:clamp(1rem,3vw,2.5rem)}\
+         .hero,.card{background:var(--panel);border:1px solid var(--line);box-shadow:0 12px 34px #34495e12}.hero{position:relative;overflow:hidden;border-radius:1.1rem;padding:clamp(1.3rem,4vw,2.5rem);margin-bottom:1rem}.hero:after{content:'';position:absolute;right:-4rem;top:-7rem;width:18rem;height:18rem;background:var(--soft);border-radius:50%}\
+         .eyebrow,.label{color:var(--muted);font-size:.72rem;font-weight:750;letter-spacing:.12em;text-transform:uppercase}.live{position:relative;z-index:1;display:inline-flex;align-items:center;gap:.45rem;color:var(--accent);font-weight:750}.live:before{content:'';width:.55rem;height:.55rem;border-radius:50%;background:var(--accent);box-shadow:0 0 0 4px var(--soft)}\
+         h1{position:relative;z-index:1;font-size:clamp(2.6rem,8vw,5.5rem);line-height:.95;letter-spacing:-.05em;margin:.65rem 0;color:var(--accent)}h2{font-size:1rem;margin:0;color:#203448}.card-head{display:flex;align-items:center;gap:.7rem;margin-bottom:1.1rem}.card-head h2{margin:0}.icon{display:grid;place-items:center;width:2.15rem;height:2.15rem;border-radius:.65rem;background:#edf4fa;color:#32617f;font-size:1.05rem;font-weight:800}\
+         p{color:#66788a}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(19rem,100%),1fr));gap:1rem}.card{border-radius:.9rem;padding:1.2rem;min-width:0}.wide{grid-column:1/-1}.facts{display:grid;gap:.7rem}.fact{display:grid;grid-template-columns:7rem minmax(0,1fr);gap:.7rem;padding-bottom:.65rem;border-bottom:1px solid var(--line)}.fact:last-child{border:0;padding-bottom:0}.fact strong{font:650 .86rem ui-monospace,SFMono-Regular,monospace;overflow-wrap:anywhere}\
+         .topic{display:block;color:#135e4a;background:#f2f8f5;border:1px solid #cde4da;border-radius:.55rem;padding:.8rem;margin:.5rem 0 1rem;overflow-wrap:anywhere;user-select:all}.metric{margin:.85rem 0}.metric-row{display:flex;justify-content:space-between;gap:1rem;margin-bottom:.35rem}.bar{height:.48rem;background:#e7edf3;border-radius:1rem;overflow:hidden}.bar i{display:block;height:100%;background:linear-gradient(90deg,#3b82c4,var(--accent));border-radius:inherit}\
+         button{appearance:none;border:1px solid #b9c7d5;border-radius:.55rem;background:#fff;color:#21384b;padding:.65rem .85rem;font-weight:750;cursor:pointer;margin:.2rem .35rem .2rem 0}button:hover{border-color:var(--accent);color:var(--accent);background:var(--soft)}table{width:100%;border-collapse:collapse;font-size:.9rem}td{padding:.55rem .25rem;border-bottom:1px solid var(--line);vertical-align:top}td:last-child{text-align:right;color:#2b4356}.ok{color:#16805d}.warn{color:#a86400}.crit{color:#c7384b}ul{padding-left:1.2rem}li{padding:.25rem}small{color:var(--muted)}@media(max-width:500px){.fact{grid-template-columns:1fr;gap:.15rem}.shell{padding:.8rem}.hero{border-radius:.8rem}}</style>",
+    );
     let _ = write!(
         html,
-        "<header><small>SERVATORY · {}</small><h1 class={}>{}</h1><p>{}</p>\
-         <form method=post action=/api/v1/notifications/test><button>Send test notification</button></form></header>",
-        if stale { "STALE" } else { "LIVE" },
+        "<body class={}><div class=shell><header class=hero><div class=live>{}</div>\
+         <div class=eyebrow style='margin-top:1.5rem'>SERVATORY STATUS</div><h1>{}</h1><p>{}</p></header>",
         level_class(level),
+        if stale { "STALE" } else { "LIVE" },
         level_text(level),
         age.map_or_else(
             || "No host snapshot received".to_string(),
@@ -639,7 +738,7 @@ fn dashboard_html(state: &SharedState) -> String {
         )
     );
     if !incidents.is_empty() {
-        html.push_str("<section class=card><h2>Active incidents</h2><ul>");
+        html.push_str("<section class='card wide'><div class=card-head><span class=icon>!</span><h2>Active incidents</h2></div><ul>");
         for incident in &incidents {
             let _ = write!(html, "<li class={}>", level_class(incident.level));
             push_html(&mut html, incident.message());
@@ -647,10 +746,12 @@ fn dashboard_html(state: &SharedState) -> String {
         }
         html.push_str("</ul></section>");
     }
+    html.push_str("<main class=grid>");
+    render_device_panels(&mut html, state);
     let Some(snapshot) = state.snapshot.as_ref() else {
+        html.push_str("</main></div></body>");
         return html;
     };
-    html.push_str("<main class=grid>");
     let pages = state
         .manifest
         .as_ref()
@@ -669,14 +770,81 @@ fn dashboard_html(state: &SharedState) -> String {
             continue;
         }
         shown[kind] = true;
-        html.push_str("<section class=card><h2>");
+        html.push_str("<section class=card><div class=card-head><span class=icon>");
+        html.push_str(page_icon(kind));
+        html.push_str("</span><h2>");
         push_html(&mut html, view.title.as_str());
-        html.push_str("</h2>");
+        html.push_str("</h2></div>");
         render_page(&mut html, &view.page, snapshot, pages);
         html.push_str("</section>");
     }
-    html.push_str("</main>");
+    html.push_str("</main></div></body>");
     html
+}
+
+fn render_device_panels(html: &mut String, state: &SharedState) {
+    let address = state
+        .station_ipv4
+        .map_or_else(|| "WAITING".to_string(), |address| address.to_string());
+    let daemon = state
+        .daemon_version
+        .as_ref()
+        .map_or("WAITING", SoftwareVersion::as_str);
+    let hostname = state
+        .manifest
+        .as_ref()
+        .map_or("servatory", |manifest| manifest.http.hostname());
+    let protocol = format!("{PROTOCOL_VERSION}");
+    html.push_str("<section class=card><div class=card-head><span class=icon>i</span><h2>About</h2></div><div class=facts>");
+    for (label, value) in [
+        ("Firmware", env!("SERVATORY_BUILD_VERSION")),
+        ("Daemon", daemon),
+        ("Protocol", protocol.as_str()),
+        ("IP address", address.as_str()),
+        ("Hostname", hostname),
+    ] {
+        html.push_str("<div class=fact><span class=label>");
+        push_html(html, label);
+        html.push_str("</span><strong>");
+        push_html(html, value);
+        html.push_str("</strong></div>");
+    }
+    html.push_str("</div></section><section class=card><div class=card-head><span class=icon>↗</span><h2>Notifications</h2></div>");
+    if let Some(topic) = state.ntfy_topic.as_deref() {
+        html.push_str("<span class=label>ntfy topic</span><code id=topic class=topic>");
+        push_html(html, topic);
+        html.push_str("</code><button type=button onclick=\"let t=document.getElementById('topic');let r=document.createRange();r.selectNodeContents(t);let s=getSelection();s.removeAllRanges();s.addRange(r);document.execCommand('copy');this.textContent='Copied'\">Copy topic</button>");
+    }
+    let (enabled, server) = state.manifest.as_ref().map_or((false, "—"), |manifest| {
+        (manifest.ntfy.enabled, manifest.ntfy.server())
+    });
+    let _ = write!(
+        html,
+        "<div class=facts style='margin-top:1rem'><div class=fact><span class=label>Status</span><strong class={}>{}</strong></div>",
+        if enabled { "ok" } else { "warn" },
+        if enabled { "ENABLED" } else { "DISABLED" }
+    );
+    html.push_str("<div class=fact><span class=label>Server</span><strong>");
+    push_html(html, server);
+    html.push_str("</strong></div></div><form method=post action=/api/v1/notifications/test><button>Send test notification</button></form><button type=button onclick=\"if(confirm('Generate a new topic? Existing ntfy subscriptions will stop receiving Servatory alerts.'))fetch('/api/v1/notifications/topic/regenerate',{method:'POST',headers:{'X-Servatory-Action':'regenerate'}}).then(()=>location.reload())\">Generate new topic</button></section>");
+}
+
+fn has_regenerate_header(request: &str) -> bool {
+    request.lines().any(|line| {
+        line.trim()
+            .eq_ignore_ascii_case("X-Servatory-Action: regenerate")
+    })
+}
+
+const fn page_icon(kind: usize) -> &'static str {
+    match kind {
+        0 => "⌂",
+        1 => "%",
+        2 => "≡",
+        3 => "↗",
+        4 => "••",
+        _ => "·",
+    }
 }
 
 fn render_page(
@@ -714,28 +882,42 @@ fn render_page(
             } else {
                 u64::from(snapshot.memory_used_mib) * 100 / u64::from(snapshot.memory_total_mib)
             };
+            render_metric(html, "CPU", snapshot.cpu_percent, "processor usage");
+            render_metric(
+                html,
+                "Memory",
+                u8::try_from(memory).unwrap_or(100),
+                &format!(
+                    "{} / {} MiB",
+                    snapshot.memory_used_mib, snapshot.memory_total_mib
+                ),
+            );
+            render_metric(
+                html,
+                "I/O pressure",
+                snapshot.io_pressure_percent,
+                "recent pressure",
+            );
             let _ = write!(
                 html,
-                "<table><tr><td>CPU<td>{}%<tr><td>Memory<td>{} / {} MiB ({memory}%)<tr><td>I/O pressure<td>{}%<tr><td>Load average<td>{:.2}</table>",
-                snapshot.cpu_percent,
-                snapshot.memory_used_mib,
-                snapshot.memory_total_mib,
-                snapshot.io_pressure_percent,
+                "<div class=fact><span class=label>Load average</span><strong>{:.2}</strong></div>",
                 f32::from(snapshot.load_average_x100) / 100.0
             );
         }
         DisplayPage::Storage { .. } => {
-            html.push_str("<table>");
             for (index, usage) in snapshot.filesystems.iter().enumerate() {
-                let _ = write!(
+                render_metric(
                     html,
-                    "<tr><td>Filesystem {}<td>{}% · {} MiB available{}",
-                    index + 1,
+                    &format!("Filesystem {}", index + 1),
                     usage.used_percent,
-                    usage.available_mib,
-                    if usage.mounted { "" } else { " · MISSING" }
+                    &format!(
+                        "{} MiB available{}",
+                        usage.available_mib,
+                        if usage.mounted { "" } else { " · MISSING" }
+                    ),
                 );
             }
+            html.push_str("<table>");
             for device in snapshot.smart.devices() {
                 html.push_str("<tr><td>");
                 push_html(html, device.label());
@@ -755,12 +937,16 @@ fn render_page(
             );
         }
         DisplayPage::PowerNetwork { .. } => {
+            if let Some(battery) = snapshot.ups.battery_percent {
+                render_metric(html, "UPS battery", battery, "remaining");
+            }
+            if let Some(load) = snapshot.ups.load_percent {
+                render_metric(html, "UPS load", load, "rated output");
+            }
             let _ = write!(
                 html,
-                "<table><tr><td>UPS<td>{:?}<tr><td>Battery<td>{}<tr><td>Load<td>{}<tr><td>Ethernet<td>{} · {} Mbps<tr><td>Internet<td>{:?}<tr><td>IPv4<td>{}.{}.{}.{}</table>",
+                "<table><tr><td>UPS<td>{:?}<tr><td>Ethernet<td>{} · {} Mbps<tr><td>Internet<td>{:?}<tr><td>Host IPv4<td>{}.{}.{}.{}</table>",
                 snapshot.ups.status,
-                optional_percent(snapshot.ups.battery_percent),
-                optional_percent(snapshot.ups.load_percent),
                 if snapshot.network_up { "up" } else { "down" },
                 snapshot.network_mbps,
                 snapshot.internet_status,
@@ -777,8 +963,12 @@ fn render_page(
                 push_html(html, guest.name());
                 let _ = write!(
                     html,
-                    "<td>{:?}<td>{}% CPU · {} / {} MiB",
-                    guest.status, guest.cpu_percent, guest.memory_used_mib, guest.memory_total_mib
+                    "<td>{:?}<td>{}% CPU · {} / {} MiB<div class=bar><i style='width:{}%'></i></div>",
+                    guest.status,
+                    guest.cpu_percent,
+                    guest.memory_used_mib,
+                    guest.memory_total_mib,
+                    guest.cpu_percent
                 );
             }
             html.push_str("</table>");
@@ -787,8 +977,16 @@ fn render_page(
     let _ = pages;
 }
 
-fn optional_percent(value: Option<u8>) -> String {
-    value.map_or_else(|| "—".to_string(), |value| format!("{value}%"))
+fn render_metric(html: &mut String, label: &str, percent: u8, detail: &str) {
+    html.push_str("<div class=metric><div class=metric-row><strong>");
+    push_html(html, label);
+    let _ = write!(html, "</strong><span>{percent}% · ");
+    push_html(html, detail);
+    let _ = write!(
+        html,
+        "</span></div><div class=bar><i style='width:{}%'></i></div></div>",
+        percent.min(100)
+    );
 }
 
 fn level_class(level: HealthLevel) -> &'static str {
@@ -882,7 +1080,7 @@ struct PendingNotification {
 }
 
 #[embassy_executor::task]
-async fn notification_worker(stack: Stack<'static>, topic: String, mut seed: u64) {
+async fn notification_worker(stack: Stack<'static>, mut seed: u64) {
     stack.wait_config_up().await;
     let tcp_state = make_static(TcpClientState::<1, 4096, 4096>::new());
     let tcp = TcpClient::new(stack, tcp_state);
@@ -968,9 +1166,11 @@ async fn notification_worker(stack: Stack<'static>, topic: String, mut seed: u64
                     }
                 }
             }
-            if let Some(notification) = pending.front().cloned() {
+            if let (Some(notification), Some(topic)) =
+                (pending.front().cloned(), state.ntfy_topic.as_deref())
+            {
                 seed = seed.wrapping_add(1);
-                if publish_notification(&tcp, &dns, config, &topic, &notification, seed).await {
+                if publish_notification(&tcp, &dns, config, topic, &notification, seed).await {
                     pending.pop_front();
                 }
             }
