@@ -52,6 +52,14 @@ fi
 chmod 0755 "$flash_dir/espflash"
 "$flash_dir/espflash" --version
 
+# Validate the ELF before stopping the live daemon. This catches malformed
+# linker layouts (including a missing app-description segment) without causing
+# avoidable display downtime.
+"$flash_dir/espflash" save-image \
+    --chip esp32s3 \
+    "$flash_dir/health-stick-firmware" \
+    "$flash_dir/health-stick-firmware.bin"
+
 echo "Temporarily stopping the display daemon..."
 sudo -v
 if systemctl cat "$service" >/dev/null 2>&1; then

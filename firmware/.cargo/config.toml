@@ -8,6 +8,8 @@ rustflags = [
     "link-arg=-nostartfiles",
     "-C",
     "link-arg=-mdynconfig=xtensa_esp32s3.so",
+    "-C",
+    "link-arg=-Wl,-T,linkall.x",
 ]
 target = "xtensa-esp32s3-none-elf"
 

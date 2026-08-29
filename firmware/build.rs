@@ -55,6 +55,14 @@ fn watch_git_revision(repository: &Path) {
     );
     println!(
         "cargo:rerun-if-changed={}",
+        repository.join("firmware/.cargo/config.toml").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        repository.join("firmware/Cargo.toml").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
         repository.join("protocol/src").display()
     );
     if let Ok(value) = fs::read_to_string(head)
