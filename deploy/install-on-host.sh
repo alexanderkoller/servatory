@@ -55,22 +55,31 @@ done
     /etc/udev/rules.d/99-m5stick-s3.rules \
     /etc/udev/rules.d/99-health-stick.rules \
     /usr/local/bin/health-stick-host
+for legacy_device in /dev/health-stick /dev/m5stick-s3; do
+    if [[ -L "$legacy_device" ]]; then
+        echo "Removing legacy device link $legacy_device..."
+        "${privilege[@]}" rm -f -- "$legacy_device"
+    fi
+done
 "${privilege[@]}" install -m 0755 \
     "$install_dir/servatory-host" /usr/local/bin/servatory-host
 "${privilege[@]}" install -m 0644 \
     "$install_dir/99-servatory.rules" /etc/udev/rules.d/99-servatory.rules
 "${privilege[@]}" install -m 0644 \
     "$install_dir/servatory.service" /etc/systemd/system/servatory.service
-if [[ ! -e /etc/servatory/config.yaml ]]; then
+config_path=/etc/servatory/config.yaml
+if [[ ! -e "$config_path" ]]; then
     "${privilege[@]}" install -d -m 0755 /etc/servatory
-    if [[ -e /etc/health-stick/config.yaml ]]; then
-        echo "Preserving the existing configuration as /etc/servatory/config.yaml..."
-        "${privilege[@]}" install -m 0644 /etc/health-stick/config.yaml /etc/servatory/config.yaml
-    else
-        "${privilege[@]}" install -m 0644 "$install_dir/servatory.yaml" /etc/servatory/config.yaml
-    fi
+    "${privilege[@]}" install -m 0644 "$install_dir/servatory.yaml" "$config_path"
 fi
-"${privilege[@]}" /usr/local/bin/servatory-host --config /etc/servatory/config.yaml --check-config
+
+# The packaged udev rule owns the stable device name. Enforce it on every
+# deployment instead of carrying forward obsolete or machine-specific names.
+"${privilege[@]}" sed -E -i \
+    's#^([[:space:]]*device:[[:space:]]*).*$#\1/dev/servatory#' \
+    "$config_path"
+
+"${privilege[@]}" /usr/local/bin/servatory-host --config "$config_path" --check-config
 
 "${privilege[@]}" udevadm control --reload-rules
 "${privilege[@]}" systemctl daemon-reload

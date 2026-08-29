@@ -25,9 +25,10 @@ use esp_hal::{
     delay::Delay,
     gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull},
     i2c::master::{Config as I2cConfig, Error as I2cError, I2c},
-    main,
+    interrupt::software::SoftwareInterruptControl,
     spi::master::{Config as SpiConfig, Spi},
     time::{Duration, Instant, Rate},
+    timer::timg::TimerGroup,
     usb_serial_jtag::UsbSerialJtag,
 };
 use heapless::{Deque, String};
@@ -39,11 +40,14 @@ use mipidsi::{
 };
 use servatory_protocol::{
     BackupJobStatus, ButtonAction, DeviceMessage, DisplayConfig, DisplayPage, FilesystemUsage,
-    FrameDecoder, GuestKind, GuestStatus, HealthLevel, HealthSnapshot, HostMessage, InternetStatus,
-    MAX_FRAME_LEN, PROTOCOL_VERSION, ProtocolError, ShutdownFailure, ShutdownPhase,
+    FrameDecoder, GuestKind, GuestStatus, HandshakeNonce, HealthLevel, HealthSnapshot, HostMessage,
+    InternetStatus, MAX_FRAME_LEN, PROTOCOL_VERSION, ProtocolError, ShutdownFailure, ShutdownPhase,
     SmartDeviceSummary, SmartStatus, SoftwareVersion, UpsStatus, decode_host, encode_device,
 };
 use static_cell::StaticCell;
+
+mod network;
+mod provisioning;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -185,9 +189,10 @@ impl UsbTx {
     }
 }
 
-fn device_hello() -> DeviceMessage {
+fn device_hello(acknowledged_session: Option<HandshakeNonce>) -> DeviceMessage {
     DeviceMessage::Hello {
         firmware_version: SoftwareVersion::new(env!("SERVATORY_BUILD_VERSION")),
+        acknowledged_session,
     }
 }
 
@@ -254,11 +259,15 @@ impl Button {
     }
 }
 
-#[main]
-fn main() -> ! {
+#[esp_rtos::main]
+async fn main(spawner: embassy_executor::Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 64 * 1024);
+    esp_alloc::heap_allocator!(size: 48 * 1024);
+    let timer_group = TimerGroup::new(peripherals.TIMG0);
+    let software_interrupts = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+    esp_rtos::start(timer_group.timer0, software_interrupts.software_interrupt0);
     let mut delay = Delay::new();
 
     // The LCD is supplied by the L3B rail, controlled by M5PM1 GPIO2. The
@@ -302,6 +311,13 @@ fn main() -> ! {
         peripherals.GPIO11,
         InputConfig::default().with_pull(Pull::Up),
     );
+    network::start(
+        spawner,
+        peripherals.WIFI,
+        peripherals.FLASH,
+        button_pin.is_low(),
+    )
+    .await;
     let mut usb = UsbSerialJtag::new(peripherals.USB_DEVICE);
     let mut decoder = FrameDecoder::<MAX_FRAME_LEN>::new();
     let mut usb_tx = UsbTx::new();
@@ -320,6 +336,7 @@ fn main() -> ! {
     let mut shutdown_usb_lost_since = None;
     let mut last_hello = None;
     let mut last_short_click = None;
+    let mut daemon_session = None;
 
     // Render before attempting any USB traffic so offline operation always works.
     render(
@@ -332,7 +349,7 @@ fn main() -> ! {
         &display_config,
         shutdown_display,
     );
-    usb_tx.enqueue(device_hello());
+    usb_tx.enqueue(device_hello(None));
     usb_tx.enqueue(DeviceMessage::Ready);
 
     loop {
@@ -341,7 +358,7 @@ fn main() -> ! {
             && daemon != DaemonState::PoweringOff
             && last_hello.is_none_or(|sent| now - sent >= HELLO_INTERVAL)
         {
-            usb_tx.enqueue(device_hello());
+            usb_tx.enqueue(device_hello(daemon_session));
             last_hello = Some(now);
         }
         let was_usb_connected = usb_connected;
@@ -371,11 +388,15 @@ fn main() -> ! {
                 continue;
             };
             match decode_host(frame) {
-                Ok(HostMessage::Hello { daemon_version }) => {
+                Ok(HostMessage::Hello {
+                    daemon_version,
+                    session,
+                }) => {
                     daemon = DaemonState::Waiting;
                     last_update = None;
+                    daemon_session = Some(session);
                     display_config.daemon_version = daemon_version;
-                    usb_tx.enqueue(device_hello());
+                    usb_tx.enqueue(device_hello(daemon_session));
                     if !shutdown_animation_active {
                         render(
                             &mut display,
@@ -388,6 +409,10 @@ fn main() -> ! {
                             shutdown_display,
                         );
                     }
+                }
+                Ok(_) if daemon_session.is_none() => {
+                    // Ignore session data until the daemon has supplied a
+                    // challenge that this Stick has acknowledged.
                 }
                 Ok(HostMessage::Update { sequence, .. }) => {
                     last_update = Some(now);
@@ -429,6 +454,7 @@ fn main() -> ! {
                     sequence, snapshot, ..
                 }) => {
                     last_update = Some(now);
+                    network::update_snapshot(snapshot.clone()).await;
                     health_snapshot = Some(snapshot);
                     daemon = DaemonState::Connected;
                     usb_tx.enqueue(DeviceMessage::Ack { sequence });
@@ -531,6 +557,9 @@ fn main() -> ! {
                         );
                     }
                 }
+                Ok(HostMessage::NetworkConfig(config)) => {
+                    network::update_manifest(config).await;
+                }
                 Err(ProtocolError::UnsupportedVersion { .. }) => {
                     daemon = DaemonState::Incompatible;
                     if !shutdown_animation_active {
@@ -554,6 +583,7 @@ fn main() -> ! {
             && last_update.is_some_and(|updated| now - updated >= LINK_TIMEOUT)
         {
             daemon = DaemonState::Stale;
+            daemon_session = None;
             if !shutdown_animation_active {
                 render(
                     &mut display,
@@ -729,7 +759,7 @@ fn main() -> ! {
         }
 
         usb_tx.poll(&mut usb);
-        delay.delay_millis(10);
+        embassy_time::Timer::after_millis(10).await;
     }
 }
 
@@ -930,6 +960,13 @@ fn render<D>(
         }
         (DaemonState::Connected, None) => {
             draw_message(framebuffer, "WAITING", "No health snapshot", accent);
+        }
+        (DaemonState::Waiting, _) if network::provisioning_display().is_some() => {
+            draw_wifi_setup(
+                framebuffer,
+                &network::provisioning_display().expect("checked provisioning display"),
+                accent,
+            );
         }
         (DaemonState::Waiting, _) if usb_connected => {
             draw_message(framebuffer, "USB READY", "Start host daemon", accent);
@@ -2137,6 +2174,29 @@ where
     )
     .draw(display)
     .ok();
+}
+
+fn draw_wifi_setup<D>(display: &mut D, details: &network::ProvisioningDisplay, color: Rgb565)
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let heading = MonoTextStyle::new(&FONT_10X20, color);
+    let body = MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE);
+    Text::new("WIFI SETUP", Point::new(12, 27), heading)
+        .draw(display)
+        .ok();
+    Text::new("NETWORK", Point::new(12, 50), body)
+        .draw(display)
+        .ok();
+    Text::new(details.ssid.as_str(), Point::new(12, 63), body)
+        .draw(display)
+        .ok();
+    Text::new("OPEN NETWORK", Point::new(12, 82), body)
+        .draw(display)
+        .ok();
+    Text::new("OPEN 192.168.4.1", Point::new(12, 105), body)
+        .draw(display)
+        .ok();
 }
 
 fn draw_shutdown_status<D>(display: &mut D, status: ShutdownDisplay, color: Rgb565)

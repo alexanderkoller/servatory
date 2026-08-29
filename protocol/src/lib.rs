@@ -7,7 +7,7 @@ use core::fmt;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-pub const PROTOCOL_VERSION: u8 = 7;
+pub const PROTOCOL_VERSION: u8 = 9;
 const FRAME_MAGIC: [u8; 2] = [0xa5, 0x5a];
 /// Maximum COBS-encoded frame size, including its trailing zero delimiter.
 pub const MAX_FRAME_LEN: usize = 16 * 1024;
@@ -17,6 +17,93 @@ pub enum HealthLevel {
     Healthy,
     Warning,
     Critical,
+}
+
+impl HealthLevel {
+    #[must_use]
+    pub const fn priority(self) -> u8 {
+        match self {
+            Self::Healthy => 0,
+            Self::Warning => 1,
+            Self::Critical => 2,
+        }
+    }
+}
+
+pub const MAX_RULE_ID_LEN: usize = 48;
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct RuleId(String);
+
+impl RuleId {
+    /// Creates a validated identifier for a configured health rule.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the identifier is empty, too long, or contains
+    /// characters other than ASCII letters, digits, `_`, and `-`.
+    pub fn new(value: &str) -> Result<Self, RuleIdError> {
+        if value.is_empty()
+            || value.len() > MAX_RULE_ID_LEN
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        {
+            return Err(RuleIdError);
+        }
+        Ok(Self(String::from(value)))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RuleIdError;
+
+impl fmt::Display for RuleIdError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "rule ID must contain 1 to {MAX_RULE_ID_LEN} ASCII letters, digits, '_' or '-'"
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub enum StickIncident {
+    HostOffline,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub enum IncidentId {
+    Rule(RuleId),
+    Stick(StickIncident),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Incident {
+    pub id: IncidentId,
+    pub level: HealthLevel,
+    message: String,
+}
+
+impl Incident {
+    #[must_use]
+    pub fn new(id: IncidentId, level: HealthLevel, message: &str) -> Self {
+        Self {
+            id,
+            level,
+            message: String::from(message),
+        }
+    }
+
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -117,6 +204,106 @@ pub struct DisplayConfig {
     pub daemon_version: SoftwareVersion,
     pub filesystem_labels: Vec<DisplayLabel>,
     pages: Vec<DisplayView>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HttpConfig {
+    pub enabled: bool,
+    pub port: u16,
+    hostname: String,
+    pages: Vec<DisplayView>,
+}
+
+impl HttpConfig {
+    #[must_use]
+    pub fn new(enabled: bool, hostname: &str, port: u16, pages: Vec<DisplayView>) -> Self {
+        Self {
+            enabled,
+            port,
+            hostname: String::from(hostname),
+            pages,
+        }
+    }
+
+    #[must_use]
+    pub fn hostname(&self) -> &str {
+        &self.hostname
+    }
+
+    #[must_use]
+    pub fn pages(&self) -> &[DisplayView] {
+        &self.pages
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum NotificationPriority {
+    Default,
+    High,
+    Urgent,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NtfyConfig {
+    pub enabled: bool,
+    pub severities: NotificationSeverities,
+    pub notify_recovery: bool,
+    pub warning_priority: NotificationPriority,
+    pub critical_priority: NotificationPriority,
+    pub recovery_priority: NotificationPriority,
+    pub repeat_critical_seconds: Option<u32>,
+    server: String,
+    click_url: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NotificationSeverities {
+    pub warning: bool,
+    pub critical: bool,
+}
+
+impl NtfyConfig {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn new(
+        enabled: bool,
+        server: &str,
+        severities: NotificationSeverities,
+        notify_recovery: bool,
+        warning_priority: NotificationPriority,
+        critical_priority: NotificationPriority,
+        recovery_priority: NotificationPriority,
+        repeat_critical_seconds: Option<u32>,
+        click_url: Option<&str>,
+    ) -> Self {
+        Self {
+            enabled,
+            severities,
+            notify_recovery,
+            warning_priority,
+            critical_priority,
+            recovery_priority,
+            repeat_critical_seconds,
+            server: String::from(server),
+            click_url: click_url.map(String::from),
+        }
+    }
+
+    #[must_use]
+    pub fn server(&self) -> &str {
+        &self.server
+    }
+
+    #[must_use]
+    pub fn click_url(&self) -> Option<&str> {
+        self.click_url.as_deref()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NetworkConfig {
+    pub http: HttpConfig,
+    pub ntfy: NtfyConfig,
 }
 
 impl Default for DisplayConfig {
@@ -233,6 +420,22 @@ impl Sequence {
 impl fmt::Display for Sequence {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[repr(transparent)]
+pub struct HandshakeNonce(u64);
+
+impl HandshakeNonce {
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
     }
 }
 
@@ -468,6 +671,7 @@ impl GuestSnapshot {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct HealthSnapshot {
     pub health: HealthReport,
+    active_incidents: Vec<Incident>,
     pub uptime_seconds: u64,
     pub cpu_percent: u8,
     pub memory_used_mib: u32,
@@ -515,6 +719,7 @@ impl HealthSnapshot {
     ) -> Self {
         Self {
             health: HealthReport::healthy(),
+            active_incidents: Vec::new(),
             uptime_seconds,
             cpu_percent: cpu_percent.min(100),
             memory_used_mib,
@@ -539,6 +744,16 @@ impl HealthSnapshot {
 
     pub fn set_health(&mut self, health: HealthReport) {
         self.health = health;
+    }
+
+    pub fn set_incidents(&mut self, health: HealthReport, active_incidents: Vec<Incident>) {
+        self.health = health;
+        self.active_incidents = active_incidents;
+    }
+
+    #[must_use]
+    pub fn active_incidents(&self) -> &[Incident] {
+        &self.active_incidents
     }
 
     #[must_use]
@@ -584,7 +799,9 @@ pub enum HostMessage {
     DisplayConfig(DisplayConfig),
     Hello {
         daemon_version: SoftwareVersion,
+        session: HandshakeNonce,
     },
+    NetworkConfig(NetworkConfig),
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -597,9 +814,14 @@ pub enum ButtonAction {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum DeviceMessage {
     Ready,
-    Ack { sequence: Sequence },
+    Ack {
+        sequence: Sequence,
+    },
     Button(ButtonAction),
-    Hello { firmware_version: SoftwareVersion },
+    Hello {
+        firmware_version: SoftwareVersion,
+        acknowledged_session: Option<HandshakeNonce>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -824,6 +1046,7 @@ mod tests {
             },
             HostMessage::Hello {
                 daemon_version: SoftwareVersion::new("0.1.0"),
+                session: HandshakeNonce::new(0x1234),
             },
         ];
         for expected in host_messages {
@@ -841,6 +1064,7 @@ mod tests {
             DeviceMessage::Button(ButtonAction::ShutdownRequested),
             DeviceMessage::Hello {
                 firmware_version: SoftwareVersion::new("0.1.0"),
+                acknowledged_session: Some(HandshakeNonce::new(0x1234)),
             },
         ];
         for expected in device_messages {
@@ -848,6 +1072,48 @@ mod tests {
             let frame = encode_device(expected.clone(), &mut storage).unwrap();
             assert_eq!(decode_device(frame), Ok(expected));
         }
+    }
+
+    #[test]
+    fn rule_ids_are_validated_and_namespaced_from_stick_incidents() {
+        let rule = RuleId::new("backup_failed").unwrap();
+        assert_eq!(rule.as_str(), "backup_failed");
+        assert!(RuleId::new("").is_err());
+        assert!(RuleId::new("not a rule").is_err());
+        assert_ne!(
+            IncidentId::Rule(RuleId::new("host_offline").unwrap()),
+            IncidentId::Stick(StickIncident::HostOffline)
+        );
+    }
+
+    #[test]
+    fn network_manifest_round_trips() {
+        let manifest = NetworkConfig {
+            http: HttpConfig::new(
+                true,
+                "servatory",
+                80,
+                DisplayConfig::default().pages().to_vec(),
+            ),
+            ntfy: NtfyConfig::new(
+                true,
+                "https://ntfy.sh",
+                NotificationSeverities {
+                    warning: true,
+                    critical: true,
+                },
+                true,
+                NotificationPriority::High,
+                NotificationPriority::Urgent,
+                NotificationPriority::Default,
+                Some(3_600),
+                Some("http://servatory.local/"),
+            ),
+        };
+        let expected = HostMessage::NetworkConfig(manifest);
+        let mut storage = [0; MAX_FRAME_LEN];
+        let frame = encode_host(expected.clone(), &mut storage).unwrap();
+        assert_eq!(decode_host(frame), Ok(expected));
     }
 
     #[test]

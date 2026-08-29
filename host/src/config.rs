@@ -10,8 +10,9 @@ use serde::{Deserialize, Deserializer};
 use serde_yaml::Value;
 use servatory_protocol::{
     BackupJobStatus, DisplayConfig, DisplayLabel, DisplayPage, DisplayView, HealthLevel,
-    HealthReport, HealthSnapshot, HostMessage, MAX_FRAME_LEN, SmartStatus, SoftwareVersion,
-    UpsStatus, encode_host,
+    HealthReport, HealthSnapshot, HostMessage, HttpConfig, Incident, IncidentId, MAX_FRAME_LEN,
+    NetworkConfig as DeviceNetworkConfig, NotificationPriority, NotificationSeverities, NtfyConfig,
+    RuleId, SmartStatus, SoftwareVersion, UpsStatus, encode_host,
 };
 
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/servatory/config.yaml";
@@ -176,7 +177,7 @@ pub struct HealthRule {
     pub message: String,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
     Healthy,
@@ -226,6 +227,7 @@ pub struct ViewConfig {
 pub struct OutputsConfig {
     pub stick: StickOutput,
     pub http: Option<HttpOutput>,
+    pub ntfy: Option<NtfyOutput>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -244,7 +246,58 @@ pub struct LcdOutput {
 #[serde(deny_unknown_fields)]
 pub struct HttpOutput {
     pub enabled: bool,
+    #[serde(default = "default_hostname")]
+    pub hostname: String,
+    #[serde(default = "default_http_port")]
+    pub port: u16,
     pub views: Vec<String>,
+}
+
+fn default_hostname() -> String {
+    "servatory".to_owned()
+}
+
+const fn default_http_port() -> u16 {
+    80
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NtfyOutput {
+    pub enabled: bool,
+    pub server: String,
+    pub severities: Vec<Severity>,
+    pub priorities: NtfyPriorities,
+    pub notify_recovery: bool,
+    #[serde(default, deserialize_with = "optional_duration")]
+    pub repeat_critical: Option<Duration>,
+    pub click_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NtfyPriorities {
+    pub warning: Priority,
+    pub critical: Priority,
+    pub recovery: Priority,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Priority {
+    Default,
+    High,
+    Urgent,
+}
+
+impl From<Priority> for NotificationPriority {
+    fn from(value: Priority) -> Self {
+        match value {
+            Priority::Default => Self::Default,
+            Priority::High => Self::High,
+            Priority::Urgent => Self::Urgent,
+        }
+    }
 }
 
 impl Config {
@@ -337,6 +390,11 @@ impl Config {
                 .with_context(|| format!("health rule {:?}", rule.id))?;
             validate_message(&rule.message, &format!("health rule {} message", rule.id))?;
         }
+        self.validate_outputs()?;
+        self.validate_manifest_sizes()
+    }
+
+    fn validate_outputs(&self) -> Result<()> {
         if let Some(http) = &self.outputs.http {
             if http.enabled && http.views.is_empty() {
                 bail!("outputs.http.views must not be empty when HTTP output is enabled");
@@ -346,12 +404,55 @@ impl Config {
                     bail!("unknown HTTP view {id:?}");
                 }
             }
+            if http.hostname.is_empty()
+                || !http
+                    .hostname
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                || http.port == 0
+            {
+                bail!("outputs.http hostname and port are invalid");
+            }
         }
+        if let Some(ntfy) = &self.outputs.ntfy {
+            if ntfy.enabled
+                && !ntfy.server.starts_with("https://")
+                && !ntfy.server.starts_with("http://")
+            {
+                bail!("outputs.ntfy.server must be an HTTP or HTTPS URL");
+            }
+            if ntfy.enabled && ntfy.severities.is_empty() {
+                bail!("outputs.ntfy.severities must not be empty when ntfy is enabled");
+            }
+            if ntfy.severities.contains(&Severity::Healthy) {
+                bail!("outputs.ntfy.severities cannot contain healthy");
+            }
+            if ntfy.enabled
+                && ntfy
+                    .repeat_critical
+                    .is_some_and(|duration| duration.is_zero())
+            {
+                bail!("outputs.ntfy.repeat-critical must be greater than zero");
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_manifest_sizes(&self) -> Result<()> {
         let display = self.display_config(0)?;
         let mut frame = vec![0_u8; MAX_FRAME_LEN];
         encode_host(HostMessage::DisplayConfig(display), &mut frame).map_err(|_| {
             anyhow::anyhow!(
                 "configured display manifest does not fit the {MAX_FRAME_LEN}-byte device frame budget"
+            )
+        })?;
+        encode_host(
+            HostMessage::NetworkConfig(self.network_config(0)?),
+            &mut frame,
+        )
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "configured network manifest does not fit the {MAX_FRAME_LEN}-byte device frame budget"
             )
         })?;
         Ok(())
@@ -375,11 +476,20 @@ impl Config {
     }
 
     fn compile_pages(&self, guest_count: usize) -> Result<Vec<DisplayView>> {
-        if self.outputs.stick.lcd.views.is_empty() {
-            bail!("outputs.stick.lcd.views must not be empty");
+        self.compile_pages_for(&self.outputs.stick.lcd.views, guest_count, "LCD")
+    }
+
+    fn compile_pages_for(
+        &self,
+        view_ids: &[String],
+        guest_count: usize,
+        output_name: &str,
+    ) -> Result<Vec<DisplayView>> {
+        if view_ids.is_empty() {
+            bail!("{output_name} views must not be empty");
         }
         let mut pages = Vec::new();
-        for id in &self.outputs.stick.lcd.views {
+        for id in view_ids {
             let view = self
                 .views
                 .get(id)
@@ -456,17 +566,85 @@ impl Config {
         Ok(pages)
     }
 
-    pub fn evaluate_health(&self, snapshot: &HealthSnapshot) -> HealthReport {
+    pub fn network_config(&self, guest_count: usize) -> Result<DeviceNetworkConfig> {
+        let http = if let Some(http) = &self.outputs.http {
+            HttpConfig::new(
+                http.enabled,
+                &http.hostname,
+                http.port,
+                self.compile_pages_for(&http.views, guest_count, "HTTP")?,
+            )
+        } else {
+            HttpConfig::new(false, "servatory", 80, Vec::new())
+        };
+        let ntfy = if let Some(ntfy) = &self.outputs.ntfy {
+            NtfyConfig::new(
+                ntfy.enabled,
+                &ntfy.server,
+                NotificationSeverities {
+                    warning: ntfy.severities.contains(&Severity::Warning),
+                    critical: ntfy.severities.contains(&Severity::Critical),
+                },
+                ntfy.notify_recovery,
+                ntfy.priorities.warning.into(),
+                ntfy.priorities.critical.into(),
+                ntfy.priorities.recovery.into(),
+                ntfy.repeat_critical
+                    .map(|duration| u32::try_from(duration.as_secs()).unwrap_or(u32::MAX)),
+                ntfy.click_url.as_deref(),
+            )
+        } else {
+            NtfyConfig::new(
+                false,
+                "https://ntfy.sh",
+                NotificationSeverities {
+                    warning: false,
+                    critical: false,
+                },
+                false,
+                NotificationPriority::High,
+                NotificationPriority::Urgent,
+                NotificationPriority::Default,
+                None,
+                None,
+            )
+        };
+        Ok(DeviceNetworkConfig { http, ntfy })
+    }
+
+    pub fn evaluate_health(&self, snapshot: &HealthSnapshot) -> (HealthReport, Vec<Incident>) {
+        let mut incidents = Vec::new();
         for rule in &self.health.rules {
             if matches_condition(&rule.when, snapshot, self) {
                 let message = render_message(&rule.message, snapshot, self);
-                return HealthReport::new(rule.severity.into(), &message);
+                incidents.push(Incident::new(
+                    IncidentId::Rule(RuleId::new(&rule.id).expect("validated health rule ID")),
+                    rule.severity.into(),
+                    &message,
+                ));
             }
         }
-        HealthReport::new(
-            self.health.default.severity.into(),
-            &self.health.default.message,
-        )
+        let primary = incidents
+            .iter()
+            .fold(None, |primary: Option<&Incident>, incident| {
+                if primary
+                    .is_none_or(|current| incident.level.priority() > current.level.priority())
+                {
+                    Some(incident)
+                } else {
+                    primary
+                }
+            })
+            .map_or_else(
+                || {
+                    HealthReport::new(
+                        self.health.default.severity.into(),
+                        &self.health.default.message,
+                    )
+                },
+                |incident| HealthReport::new(incident.level, incident.message()),
+            );
+        (primary, incidents)
     }
 }
 
@@ -474,6 +652,7 @@ fn validate_ids<'a>(ids: impl Iterator<Item = &'a str>, kind: &str) -> Result<()
     let mut seen = HashSet::new();
     for id in ids {
         if id.is_empty()
+            || id.len() > servatory_protocol::MAX_RULE_ID_LEN
             || !id
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
@@ -981,13 +1160,15 @@ mod tests {
         let config = current_config();
         let mut snapshot = healthy_snapshot();
         assert_eq!(
-            config.evaluate_health(&snapshot).level,
+            config.evaluate_health(&snapshot).0.level,
             HealthLevel::Healthy
         );
         snapshot.network_up = false;
-        let report = config.evaluate_health(&snapshot);
+        let (report, incidents) = config.evaluate_health(&snapshot);
         assert_eq!(report.level, HealthLevel::Critical);
         assert_eq!(report.message(), "LINK DOWN");
+        assert_eq!(incidents.len(), 1);
+        assert!(matches!(incidents[0].id, IncidentId::Rule(_)));
     }
 
     #[test]
@@ -995,8 +1176,23 @@ mod tests {
         let config = current_config();
         let mut snapshot = healthy_snapshot();
         snapshot.last_successful_backup_age_seconds = Some(24 * 60 * 60 + 1);
-        let report = config.evaluate_health(&snapshot);
+        let (report, incidents) = config.evaluate_health(&snapshot);
         assert_eq!(report.level, HealthLevel::Warning);
         assert_eq!(report.message(), "BACKUP OVERDUE");
+        assert_eq!(incidents.len(), 1);
+    }
+
+    #[test]
+    fn all_matching_incidents_are_preserved_and_primary_uses_severity_then_order() {
+        let config = current_config();
+        let mut snapshot = healthy_snapshot();
+        snapshot.network_up = false;
+        snapshot.cpu_percent = 99;
+        let (primary, incidents) = config.evaluate_health(&snapshot);
+        assert_eq!(primary.level, HealthLevel::Critical);
+        assert_eq!(primary.message(), "LINK DOWN");
+        assert_eq!(incidents.len(), 2);
+        assert_eq!(incidents[0].message(), "LINK DOWN");
+        assert_eq!(incidents[1].message(), "CPU 99%");
     }
 }

@@ -204,7 +204,8 @@ tasks. The limit must be positive.
 
 ## Health evaluation
 
-The `health` section converts measurements into one primary status and message:
+The `health` section converts measurements into a primary status and a complete
+set of active incidents:
 
 ```yaml
 health:
@@ -222,10 +223,12 @@ health:
       message: "CPU {value}%"
 ```
 
-Rules are evaluated from top to bottom. The first matching rule supplies the
-displayed severity and message; later rules are not considered for that update.
-Put the conditions that should take priority first. If no rule matches,
-`health.default` is used.
+Every matching rule becomes an active incident and retains its configured rule
+ID. The primary status shown on the LCD is the matching incident with the
+highest severity. Ties use YAML order. The HTTP dashboard and notification
+engine receive the complete set, so one failure does not hide another. If no
+rule matches, `health.default` supplies the healthy status and no configured
+incidents are active.
 
 Rule IDs must be unique, non-empty, and limited to ASCII letters, digits, `_`,
 and `-`. A severity is `healthy`, `warning`, or `critical`. Messages must be
@@ -398,13 +401,39 @@ outputs:
     lcd:
       views: [overview, resources, storage, power_network, guests]
   http:
-    enabled: false
+    enabled: true
+    hostname: servatory
+    port: 80
     views: [overview, resources, storage, power_network, guests]
+  ntfy:
+    enabled: true
+    server: https://ntfy.sh
+    severities: [warning, critical]
+    priorities: { warning: high, critical: urgent, recovery: default }
+    notify_recovery: true
+    repeat_critical: 1h
+    click_url: http://servatory.local/
 ```
 
 `outputs.stick.lcd.views` selects reusable view IDs and sets their button order.
 The list must not be empty, and every ID must exist under `views`.
 
-`outputs.http` is optional and reserved for a future on-Stick HTTP server. The
-current firmware does not provide that server, even if `enabled` is `true`.
-Keep it disabled. Wi-Fi credentials are not part of this YAML format.
+`outputs.http` selects the views rendered by the on-stick mobile dashboard.
+`hostname` is the expected local network name and `port` is the listening TCP
+port. The hostname must contain only ASCII letters, digits, and hyphens. A
+selected HTTP view uses the same fields and labels as its LCD counterpart;
+paginated LCD content becomes a continuous web section.
+
+`outputs.ntfy` controls incident delivery. `server` must be an HTTP or HTTPS
+base URL. The supplied HTTPS configuration verifies ntfy.sh through the bundled
+ISRG Root X1 trust anchor. `severities` selects incident starts, while
+`notify_recovery` enables per-incident recovery messages. Priorities accept
+`default`, `high`, and `urgent`. `repeat_critical` is optional; when present, an
+unresolved critical is repeated at that interval. `click_url` is optional and
+becomes the notification's dashboard link.
+
+Wi-Fi credentials and the ntfy topic are deliberately absent. They are secrets
+stored in the StickS3's persistent flash by the provisioning page. The host
+sends only the non-secret output manifest over USB. The stick also persists
+that manifest when it changes, allowing the dashboard structure and notification
+policy to survive a host outage.

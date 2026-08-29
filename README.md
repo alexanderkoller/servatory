@@ -3,7 +3,8 @@
 Servatory turns an [M5Stack StickS3](https://docs.m5stack.com/en/core/StickS3) into a small, USB-connected status display
 for a Proxmox server. A daemon on the server collects host, storage, network,
 UPS, backup, and guest information and sends it to the display. The StickS3 does
-not use Wi-Fi or Bluetooth.
+not depend on the host for network access: its built-in Wi-Fi serves the same
+health information as a mobile dashboard and sends ntfy incident notifications.
 
 The display is configured from one YAML file. You choose which filesystems and
 disks to monitor, which conditions count as warnings or critical failures, and
@@ -58,6 +59,11 @@ Edit these values to match your server. The [configuration
 reference](docs/configuration.md) describes the complete YAML format, including
 health rules, views, timings, and shutdown control.
 
+Wi-Fi credentials and the ntfy topic are not stored in this file. The first
+boot starts a temporary setup network and saves those secrets directly on the
+StickS3. See [Wi-Fi dashboard and notifications](docs/network.md) for the setup
+procedure and failure behavior.
+
 After editing the installed file, validate it before restarting the service:
 
 ```sh
@@ -78,10 +84,10 @@ install it over SSH. This route is useful when you do not want a Rust toolchain
 or build packages on the Proxmox host. It is not required to build or run the
 service.
 
-When updating an earlier Health Stick installation, the remote installer copies
-the existing configuration to `/etc/servatory/config.yaml` and retires the old
-binary, systemd unit, and udev rule. It leaves the old configuration directory
-in place as a backup.
+When updating an earlier installation, the remote installer retires the old
+binary, systemd unit, udev rule, and legacy `/dev` symlinks. It does not import
+legacy configuration. On every deployment, the active configuration is set to
+the current stable device name, `/dev/servatory`, before the service starts.
 
 Install Zig and `cargo-zigbuild` on the Mac:
 
@@ -142,7 +148,10 @@ never saved and replayed after a disconnected session.
 
 The StickS3 remains responsive without the daemon. Its offline screens
 distinguish a missing USB data connection from a USB connection on which no
-valid daemon session is active.
+valid daemon session is active. When Wi-Fi remains available, the web dashboard
+also stays reachable and marks its host measurements as cached. The stick can
+detect that updates stopped, but it cannot continue measuring host CPU, disks,
+UPS state, or guests by itself.
 
 ## Check the service
 

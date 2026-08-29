@@ -207,7 +207,7 @@ impl<S: Shutdown> EventHandler<S> {
     ) -> anyhow::Result<bool> {
         match message {
             DeviceMessage::Ready => {
-                eprintln!("display connected");
+                eprintln!("display transport ready; waiting for protocol handshake");
                 self.session_established = false;
                 Ok(false)
             }

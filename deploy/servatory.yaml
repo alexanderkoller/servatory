@@ -207,8 +207,19 @@ outputs:
   stick:
     lcd:
       views: [overview, resources, storage, power_network, guests]
-  # Reserved for the future on-stick Wi-Fi HTTP server. Credentials are not
-  # part of this file; they will be provisioned in the Stick's persistent memory.
   http:
-    enabled: false
+    enabled: true
+    hostname: servatory
+    port: 80
     views: [overview, resources, storage, power_network, guests]
+  ntfy:
+    enabled: true
+    server: https://ntfy.sh
+    severities: [warning, critical]
+    priorities:
+      warning: high
+      critical: urgent
+      recovery: default
+    notify_recovery: true
+    repeat_critical: 1h
+    click_url: http://servatory.local/

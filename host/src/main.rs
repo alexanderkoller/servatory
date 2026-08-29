@@ -1,7 +1,7 @@
 use std::{
     io::Read,
     path::PathBuf,
-    thread,
+    process, thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -9,8 +9,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use servatory_host::{EventHandler, SystemdShutdown, write_host_message};
 use servatory_protocol::{
-    DeviceMessage, FrameDecoder, HealthLevel, HealthReport, HostMessage, MAX_FRAME_LEN,
-    PROTOCOL_VERSION, ProtocolError, Sequence, SoftwareVersion, UnixSeconds, decode_device,
+    DeviceMessage, FrameDecoder, HandshakeNonce, HealthLevel, HealthReport, HostMessage,
+    MAX_FRAME_LEN, PROTOCOL_VERSION, ProtocolError, Sequence, SoftwareVersion, UnixSeconds,
+    decode_device,
 };
 
 mod config;
@@ -43,6 +44,7 @@ fn main() -> Result<()> {
     let reconnect_delay = config.connection.usb_serial.reconnect_interval;
     let device = &config.connection.usb_serial.device;
     let mut display_config = config.display_config(0)?;
+    let mut network_config = config.network_config(0)?;
     let mut next_update = Instant::now();
     let mut sequence = Sequence::ZERO;
     let mut decoder = FrameDecoder::<MAX_FRAME_LEN>::new();
@@ -71,6 +73,8 @@ fn main() -> Result<()> {
     let mut handshake_started = Instant::now();
     let mut handshake_timeout_logged = false;
     let mut incompatible_version = None;
+    let mut input_synchronized = false;
+    let mut handshake_nonce = new_handshake_nonce();
 
     loop {
         if port.is_none() {
@@ -91,6 +95,8 @@ fn main() -> Result<()> {
                     handshake_timeout_logged = false;
                     incompatible_version = None;
                     waiting_logged = false;
+                    input_synchronized = false;
+                    handshake_nonce = new_handshake_nonce();
                 }
                 Err(error) => {
                     if !waiting_logged {
@@ -110,6 +116,7 @@ fn main() -> Result<()> {
             if let Err(error) = write_host_message(
                 HostMessage::Hello {
                     daemon_version: SoftwareVersion::new(env!("SERVATORY_BUILD_VERSION")),
+                    session: handshake_nonce,
                 },
                 connected_port,
             ) {
@@ -134,6 +141,11 @@ fn main() -> Result<()> {
                 connected_port,
             ) {
                 connection_error = Some(error.context("writing display configuration"));
+            } else if let Err(error) = write_host_message(
+                HostMessage::NetworkConfig(network_config.clone()),
+                connected_port,
+            ) {
+                connection_error = Some(error.context("writing network configuration"));
             } else {
                 manifest_pending = false;
             }
@@ -153,8 +165,19 @@ fn main() -> Result<()> {
                     display_config = next_display_config;
                 }
             }
-            let status = config.evaluate_health(&snapshot);
-            snapshot.set_health(status.clone());
+            let next_network_config = config.network_config(snapshot.guests.guests().len())?;
+            if next_network_config != network_config {
+                if let Err(error) = write_host_message(
+                    HostMessage::NetworkConfig(next_network_config.clone()),
+                    connected_port,
+                ) {
+                    connection_error = Some(error.context("updating network configuration"));
+                } else {
+                    network_config = next_network_config;
+                }
+            }
+            let (status, incidents) = config.evaluate_health(&snapshot);
+            snapshot.set_incidents(status.clone(), incidents);
             log_health_status_change(&mut last_health_status, status);
             if connection_error.is_none()
                 && let Err(error) = write_host_message(
@@ -177,17 +200,29 @@ fn main() -> Result<()> {
             match connected_port.read(&mut input) {
                 Ok(count) => {
                     for &byte in &input[..count] {
+                        // The port may open in the middle of a frame emitted
+                        // before this process acquired it. Synchronize at the
+                        // next delimiter; both peers repeat Hello until the
+                        // handshake completes.
+                        if !input_synchronized {
+                            if byte == 0 {
+                                input_synchronized = true;
+                                decoder = FrameDecoder::new();
+                            }
+                            continue;
+                        }
                         let Some(frame) = decoder.push(byte) else {
                             continue;
                         };
                         match frame.and_then(decode_device) {
-                            Ok(DeviceMessage::Hello { firmware_version }) => {
-                                if handshake_established {
-                                    // A fresh Hello on an open serial port means the stick
-                                    // restarted without requiring a USB disconnect.
-                                    manifest_pending = true;
-                                    next_update = Instant::now();
-                                } else {
+                            Ok(DeviceMessage::Hello {
+                                firmware_version,
+                                acknowledged_session,
+                            }) => {
+                                if acknowledged_session == Some(handshake_nonce) {
+                                    if handshake_established {
+                                        continue;
+                                    }
                                     eprintln!(
                                         "display firmware {} protocol v{PROTOCOL_VERSION} handshake established",
                                         firmware_version.as_str()
@@ -195,14 +230,27 @@ fn main() -> Result<()> {
                                     handshake_established = true;
                                     manifest_pending = true;
                                     next_update = Instant::now();
+                                } else {
+                                    // An unacknowledged Hello is emitted at
+                                    // Stick startup. A mismatched nonce can be
+                                    // an acknowledgement left over from an old
+                                    // daemon process. In both cases, issue the
+                                    // current challenge until it is echoed.
+                                    if handshake_established {
+                                        eprintln!(
+                                            "display restarted; establishing a new protocol handshake"
+                                        );
+                                        handshake_established = false;
+                                        handshake_started = Instant::now();
+                                        handshake_timeout_logged = false;
+                                    }
+                                    next_hello = Instant::now();
                                 }
                             }
                             Ok(DeviceMessage::Ready) => {
-                                if !handshake_established {
-                                    handshake_established = true;
-                                    manifest_pending = true;
-                                    next_update = Instant::now();
-                                }
+                                // Ready confirms USB transport activity but
+                                // carries no firmware version. Only Hello can
+                                // establish a compatible protocol session.
                                 if let Err(error) =
                                     handler.handle(&DeviceMessage::Ready, connected_port)
                                 {
@@ -263,6 +311,16 @@ fn current_unix_seconds() -> Result<u64> {
         .duration_since(UNIX_EPOCH)
         .context("system clock is before the Unix epoch")?
         .as_secs())
+}
+
+fn new_handshake_nonce() -> HandshakeNonce {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let low = u64::try_from(now & u128::from(u64::MAX)).unwrap_or(0);
+    let high = u64::try_from(now >> 64).unwrap_or(0);
+    let folded_time = low ^ high;
+    HandshakeNonce::new(folded_time ^ (u64::from(process::id()) << 32))
 }
 
 fn log_health_status_change(previous: &mut Option<HealthReport>, current: HealthReport) {
