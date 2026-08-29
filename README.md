@@ -1,6 +1,6 @@
 # Servatory
 
-Servatory turns an M5Stack StickS3 into a small, USB-connected status display
+Servatory turns an [M5Stack StickS3](https://docs.m5stack.com/en/core/StickS3) into a small, USB-connected status display
 for a Proxmox server. A daemon on the server collects host, storage, network,
 UPS, backup, and guest information and sends it to the display. The StickS3 does
 not use Wi-Fi or Bluetooth.
