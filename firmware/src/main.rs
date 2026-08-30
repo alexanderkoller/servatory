@@ -443,6 +443,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                     render_pending = true;
                 }
                 Ok(HostMessage::DisplayConfig(config)) => {
+                    network::update_filesystem_labels(config.filesystem_labels.clone()).await;
                     display_config = config;
                     page %= display_config.pages().len().max(1);
                     render_pending = true;

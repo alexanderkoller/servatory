@@ -44,5 +44,24 @@ async function sendTestNotification(button) {
     }, 2000);
 }
 
+async function copyNtfyTopic(button) {
+    const topic = document.getElementById('topic');
+    if (!topic) return;
+    try {
+        await navigator.clipboard.writeText(topic.textContent.trim());
+    } catch (_) {
+        const range = document.createRange();
+        range.selectNodeContents(topic);
+        const selection = getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+        document.execCommand('copy');
+        selection.removeAllRanges();
+    }
+    const original = button.textContent;
+    button.textContent = 'Copied';
+    setTimeout(() => { button.textContent = original; }, 1600);
+}
+
 setInterval(refreshDashboard, 5000);
 document.addEventListener('visibilitychange', refreshDashboard);

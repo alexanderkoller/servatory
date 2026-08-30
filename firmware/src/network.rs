@@ -39,8 +39,9 @@ use reqwless::{
     request::{Method, RequestBuilder},
 };
 use servatory_protocol::{
-    DisplayPage, HealthLevel, HealthSnapshot, Incident, IncidentId, NetworkConfig,
-    NotificationPriority, PROTOCOL_VERSION, SoftwareVersion, StickIncident,
+    BackupJobStatus, DisplayLabel, DisplayPage, GuestKind, GuestStatus, HealthLevel,
+    HealthSnapshot, Incident, IncidentId, InternetStatus, NetworkConfig, NotificationPriority,
+    PROTOCOL_VERSION, SmartStatus, SoftwareVersion, StickIncident, UpsStatus,
 };
 use static_cell::StaticCell;
 
@@ -61,6 +62,7 @@ const NOTIFICATION_TLS_RX_SIZE: usize = 16_384;
 const NOTIFICATION_TLS_TX_SIZE: usize = 4_096;
 const NOTIFICATION_RESPONSE_SIZE: usize = 1_024;
 const DASHBOARD_SCRIPT: &str = concat!("<script>", include_str!("dashboard.js"), "</script>");
+const DASHBOARD_STYLE: &str = concat!("<style>", include_str!("dashboard.css"), "</style>");
 const ISRG_ROOT_X1: &str = concat!(
     "MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw",
     "TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh",
@@ -97,6 +99,7 @@ const ISRG_ROOT_X1: &str = concat!(
 struct SharedState {
     snapshot: Option<Arc<HealthSnapshot>>,
     manifest: Option<Arc<NetworkConfig>>,
+    filesystem_labels: Vec<DisplayLabel>,
     last_update: Option<Instant>,
     station_ipv4: Option<Ipv4Addr>,
     ntfy_topic: Option<String>,
@@ -108,6 +111,7 @@ impl SharedState {
         Self {
             snapshot: None,
             manifest: None,
+            filesystem_labels: Vec::new(),
             last_update: None,
             station_ipv4: None,
             ntfy_topic: None,
@@ -178,6 +182,10 @@ pub async fn update_snapshot(snapshot: Arc<HealthSnapshot>) {
     let mut state = STATE.lock().await;
     state.snapshot = Some(snapshot);
     state.last_update = Some(Instant::now());
+}
+
+pub async fn update_filesystem_labels(labels: Vec<DisplayLabel>) {
+    STATE.lock().await.filesystem_labels = labels;
 }
 
 pub async fn update_manifest(manifest: NetworkConfig) {
@@ -865,36 +873,35 @@ fn dashboard_markup(state: &SharedState, document: bool) -> String {
         .unwrap_or(HealthLevel::Healthy);
     let mut html = String::new();
     if document {
-        html.push_str(
-        "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>\
-         <style>\
-         *{box-sizing:border-box}:root{color-scheme:light;--bg:#f3f6fa;--panel:#fff;--line:#dfe7ef;--muted:#68798a;--text:#152536}\
-         body{--accent:#16805d;--soft:#e6f5ef;margin:0;background:radial-gradient(circle at 92% 0,#e5f1ff 0,transparent 30rem),var(--bg);color:var(--text);font:15px ui-sans-serif,system-ui,-apple-system,sans-serif;min-height:100vh;border-top:4px solid var(--accent)}\
-         body.warn{--accent:#a86400;--soft:#fff3d6}body.crit{--accent:#c7384b;--soft:#ffeaed}.shell{width:min(74rem,100%);margin:auto;padding:clamp(1rem,3vw,2.5rem)}\
-         .hero,.card{background:var(--panel);border:1px solid var(--line);box-shadow:0 12px 34px #34495e12}.hero{position:relative;overflow:hidden;border-radius:1.1rem;padding:clamp(1.3rem,4vw,2.5rem);margin-bottom:1rem}.hero:after{content:'';position:absolute;right:-4rem;top:-7rem;width:18rem;height:18rem;background:var(--soft);border-radius:50%}\
-         .eyebrow,.label{color:var(--muted);font-size:.72rem;font-weight:750;letter-spacing:.12em;text-transform:uppercase}.live{position:relative;z-index:1;display:inline-flex;align-items:center;gap:.45rem;color:var(--accent);font-weight:750}.live:before{content:'';width:.55rem;height:.55rem;border-radius:50%;background:var(--accent);box-shadow:0 0 0 4px var(--soft)}\
-         h1{position:relative;z-index:1;font-size:clamp(2.6rem,8vw,5.5rem);line-height:.95;letter-spacing:-.05em;margin:.65rem 0;color:var(--accent)}h2{font-size:1rem;margin:0;color:#203448}.card-head{display:flex;align-items:center;gap:.7rem;margin-bottom:1.1rem}.card-head h2{margin:0}.icon{display:grid;place-items:center;width:2.15rem;height:2.15rem;border-radius:.65rem;background:#edf4fa;color:#32617f;font-size:1.05rem;font-weight:800}\
-         p{color:#66788a}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(19rem,100%),1fr));gap:1rem}.card{border-radius:.9rem;padding:1.2rem;min-width:0}.wide{grid-column:1/-1}.facts{display:grid;gap:.7rem}.fact{display:grid;grid-template-columns:7rem minmax(0,1fr);gap:.7rem;padding-bottom:.65rem;border-bottom:1px solid var(--line)}.fact:last-child{border:0;padding-bottom:0}.fact strong{font:650 .86rem ui-monospace,SFMono-Regular,monospace;overflow-wrap:anywhere}\
-         .topic{display:block;color:#135e4a;background:#f2f8f5;border:1px solid #cde4da;border-radius:.55rem;padding:.8rem;margin:.5rem 0 1rem;overflow-wrap:anywhere;user-select:all}.metric{margin:.85rem 0}.metric-row{display:flex;justify-content:space-between;gap:1rem;margin-bottom:.35rem}.bar{height:.48rem;background:#e7edf3;border-radius:1rem;overflow:hidden}.bar i{display:block;height:100%;background:linear-gradient(90deg,#3b82c4,var(--accent));border-radius:inherit}\
-         button{appearance:none;border:1px solid #b9c7d5;border-radius:.55rem;background:#fff;color:#21384b;padding:.65rem .85rem;font-weight:750;cursor:pointer;margin:.2rem .35rem .2rem 0}button:hover{border-color:var(--accent);color:var(--accent);background:var(--soft)}button:disabled{cursor:wait;opacity:.75}.test-feedback{display:inline-block;min-width:5rem;color:var(--muted);font-size:.82rem;font-weight:700}.sending:before{content:'';display:inline-block;width:.75rem;height:.75rem;margin-right:.45rem;border:2px solid #b9c7d5;border-top-color:var(--accent);border-radius:50%;vertical-align:-.12rem;animation:spin .7s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}table{width:100%;border-collapse:collapse;font-size:.9rem}td{padding:.55rem .25rem;border-bottom:1px solid var(--line);vertical-align:top}td:last-child{text-align:right;color:#2b4356}.ok{color:#16805d}.warn{color:#a86400}.crit{color:#c7384b}ul{padding-left:1.2rem}li{padding:.25rem}small{color:var(--muted)}@media(max-width:500px){.fact{grid-template-columns:1fr;gap:.15rem}.shell{padding:.8rem}.hero{border-radius:.8rem}}</style>",
-        );
+        html.push_str("<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta name=theme-color content='#08131d'><title>Servatory status</title>");
+        html.push_str(DASHBOARD_STYLE);
         html.push_str(DASHBOARD_SCRIPT);
-        let _ = write!(html, "<body class={}>", level_class(level));
+        let _ = write!(html, "</head><body class={}>", level_class(level));
     }
+    let age_text = age.map_or_else(
+        || "No host snapshot received".to_string(),
+        |seconds| match seconds {
+            0 => "Updated just now".to_string(),
+            1 => "Updated 1 second ago".to_string(),
+            _ => format!("Updated {seconds} seconds ago"),
+        },
+    );
     let _ = write!(
         html,
-        "<div class=shell data-body-class={}><header class=hero><div class=live>{}</div>\
-         <div class=eyebrow style='margin-top:1.5rem'>SERVATORY STATUS</div><h1>{}</h1><p>{}</p></header>",
+        "<div class=shell data-body-class={}><header class=hero><div class=hero-top><div class=brand><span class=brand-mark>{}</span><span>SERVATORY</span></div><div class=live>{}</div></div>\
+         <div class=hero-status><div class=eyebrow>System health</div><h1>{}</h1><p>{}</p></div></header>",
         level_class(level),
+        dashboard_icon(0),
         if stale { "STALE" } else { "LIVE" },
         level_text(level),
-        age.map_or_else(
-            || "No host snapshot received".to_string(),
-            |age| format!("Updated {age} seconds ago")
-        )
+        age_text,
     );
     if !incidents.is_empty() {
-        html.push_str("<section class='card wide'><div class=card-head><span class=icon>!</span><h2>Active incidents</h2></div><ul>");
+        html.push_str(
+            "<section class='card wide'><div class=card-head><span class='icon icon-alert'>",
+        );
+        html.push_str(dashboard_icon(7));
+        html.push_str("</span><h2>Active incidents</h2></div><ul class=incident-list>");
         for incident in &incidents {
             let _ = write!(html, "<li class={}>", level_class(incident.level));
             push_html(&mut html, incident.message());
@@ -903,11 +910,11 @@ fn dashboard_markup(state: &SharedState, document: bool) -> String {
         html.push_str("</ul></section>");
     }
     html.push_str("<main class=grid>");
-    render_device_panels(&mut html, state);
     let Some(snapshot) = state.snapshot.as_ref() else {
+        render_device_panels(&mut html, state);
         html.push_str("</main></div>");
         if document {
-            html.push_str("</body>");
+            html.push_str("</body></html>");
         }
         return html;
     };
@@ -929,17 +936,22 @@ fn dashboard_markup(state: &SharedState, document: bool) -> String {
             continue;
         }
         shown[kind] = true;
-        html.push_str("<section class=card><div class=card-head><span class=icon>");
-        html.push_str(page_icon(kind));
+        let _ = write!(
+            html,
+            "<section class='card page-card {}'><div class=card-head><span class=icon>",
+            page_class(kind)
+        );
+        html.push_str(dashboard_icon(kind));
         html.push_str("</span><h2>");
         push_html(&mut html, view.title.as_str());
         html.push_str("</h2></div>");
-        render_page(&mut html, &view.page, snapshot);
+        render_page(&mut html, &view.page, snapshot, &state.filesystem_labels);
         html.push_str("</section>");
     }
+    render_device_panels(&mut html, state);
     html.push_str("</main></div>");
     if document {
-        html.push_str("</body>");
+        html.push_str("</body></html>");
     }
     html
 }
@@ -957,7 +969,32 @@ fn render_device_panels(html: &mut String, state: &SharedState) {
         .as_ref()
         .map_or("servatory", |manifest| manifest.http.hostname());
     let protocol = format!("{PROTOCOL_VERSION}");
-    html.push_str("<section class=card><div class=card-head><span class=icon>i</span><h2>About</h2></div><div class=facts>");
+    html.push_str("<section class='card notifications'><div class=card-head><span class=icon>");
+    html.push_str(dashboard_icon(5));
+    html.push_str("</span><h2>Notifications</h2></div>");
+    if let Some(topic) = state.ntfy_topic.as_deref() {
+        html.push_str(
+            "<span class=label>ntfy topic</span><div class=topic-wrap><code id=topic class=topic>",
+        );
+        push_html(html, topic);
+        html.push_str("</code><button class=copy-button type=button onclick='copyNtfyTopic(this)'>Copy</button></div>");
+    }
+    let (enabled, server) = state.manifest.as_ref().map_or((false, "—"), |manifest| {
+        (manifest.ntfy.enabled, manifest.ntfy.server())
+    });
+    let _ = write!(
+        html,
+        "<div class=facts><div class=fact><span class=label>Status</span><strong class={}>{}</strong></div>",
+        if enabled { "ok" } else { "warn" },
+        if enabled { "ENABLED" } else { "DISABLED" }
+    );
+    html.push_str("<div class=fact><span class=label>Server</span><strong>");
+    push_html(html, server);
+    html.push_str("</strong></div></div><div class=button-row><button data-client-state type=button onclick='sendTestNotification(this)'>Send test notification</button><span data-client-state id=test-feedback class=test-feedback aria-live=polite></span><button class=button-secondary type=button onclick=\"if(confirm('Generate a new topic? Existing ntfy subscriptions will stop receiving Servatory alerts.'))fetch('/api/v1/notifications/topic/regenerate',{method:'POST',headers:{'X-Servatory-Action':'regenerate'}}).then(()=>location.reload())\">Generate new topic</button></div></section>");
+
+    html.push_str("<section class='card about'><div class=card-head><span class=icon>");
+    html.push_str(dashboard_icon(6));
+    html.push_str("</span><h2>About</h2></div><div class=facts>");
     for (label, value) in [
         ("Firmware", env!("SERVATORY_BUILD_VERSION")),
         ("Daemon", daemon),
@@ -971,59 +1008,89 @@ fn render_device_panels(html: &mut String, state: &SharedState) {
         push_html(html, value);
         html.push_str("</strong></div>");
     }
-    html.push_str("</div></section><section class=card><div class=card-head><span class=icon>↗</span><h2>Notifications</h2></div>");
-    if let Some(topic) = state.ntfy_topic.as_deref() {
-        html.push_str("<span class=label>ntfy topic</span><code id=topic class=topic>");
-        push_html(html, topic);
-        html.push_str("</code><button type=button onclick=\"let t=document.getElementById('topic');let r=document.createRange();r.selectNodeContents(t);let s=getSelection();s.removeAllRanges();s.addRange(r);document.execCommand('copy');this.textContent='Copied'\">Copy topic</button>");
-    }
-    let (enabled, server) = state.manifest.as_ref().map_or((false, "—"), |manifest| {
-        (manifest.ntfy.enabled, manifest.ntfy.server())
-    });
-    let _ = write!(
-        html,
-        "<div class=facts style='margin-top:1rem'><div class=fact><span class=label>Status</span><strong class={}>{}</strong></div>",
-        if enabled { "ok" } else { "warn" },
-        if enabled { "ENABLED" } else { "DISABLED" }
+    html.push_str(
+        "</div><p class=about-note>Servatory firmware and host connection details.</p></section>",
     );
-    html.push_str("<div class=fact><span class=label>Server</span><strong>");
-    push_html(html, server);
-    html.push_str("</strong></div></div><button data-client-state type=button onclick=\"sendTestNotification(this)\">Send test notification</button><span data-client-state id=test-feedback class=test-feedback aria-live=polite></span><br><button type=button onclick=\"if(confirm('Generate a new topic? Existing ntfy subscriptions will stop receiving Servatory alerts.'))fetch('/api/v1/notifications/topic/regenerate',{method:'POST',headers:{'X-Servatory-Action':'regenerate'}}).then(()=>location.reload())\">Generate new topic</button></section>");
 }
 
-const fn page_icon(kind: usize) -> &'static str {
+const fn page_class(kind: usize) -> &'static str {
     match kind {
-        0 => "⌂",
-        1 => "%",
-        2 => "≡",
-        3 => "↗",
-        4 => "••",
-        _ => "·",
+        0 => "page-overview",
+        1 => "page-resources",
+        2 => "page-storage",
+        3 => "page-power",
+        4 => "page-guests",
+        _ => "",
     }
 }
 
-fn render_page(html: &mut String, page: &DisplayPage, snapshot: &HealthSnapshot) {
+// Lucide icons stay crisp at any density and keep this embedded page self-contained.
+const fn dashboard_icon(kind: usize) -> &'static str {
+    match kind {
+        0 => {
+            "<svg aria-hidden=true viewBox='0 0 24 24' fill=none stroke=currentColor stroke-width=2 stroke-linecap=round stroke-linejoin=round><path d='M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2'/></svg>"
+        }
+        1 => {
+            "<svg aria-hidden=true viewBox='0 0 24 24' fill=none stroke=currentColor stroke-width=2 stroke-linecap=round stroke-linejoin=round><path d='m12 14 4-4'/><path d='M3.34 19a10 10 0 1 1 17.32 0'/></svg>"
+        }
+        2 => {
+            "<svg aria-hidden=true viewBox='0 0 24 24' fill=none stroke=currentColor stroke-width=2 stroke-linecap=round stroke-linejoin=round><path d='M10 16h.01'/><path d='M2.212 11.577a2 2 0 0 0-.212.896V18a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-5.527a2 2 0 0 0-.212-.896L18.55 5.11A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z'/><path d='M21.946 12.013H2.054'/><path d='M6 16h.01'/></svg>"
+        }
+        3 => {
+            "<svg aria-hidden=true viewBox='0 0 24 24' fill=none stroke=currentColor stroke-width=2 stroke-linecap=round stroke-linejoin=round><rect x=16 y=16 width=6 height=6 rx=1/><rect x=2 y=16 width=6 height=6 rx=1/><rect x=9 y=2 width=6 height=6 rx=1/><path d='M5 16v-3a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v3'/><path d='M12 12V8'/></svg>"
+        }
+        4 => {
+            "<svg aria-hidden=true viewBox='0 0 24 24' fill=none stroke=currentColor stroke-width=2 stroke-linecap=round stroke-linejoin=round><path d='M2.97 12.92A2 2 0 0 0 2 14.63v3.24a2 2 0 0 0 .97 1.71l3 1.8a2 2 0 0 0 2.06 0L12 19v-5.5l-5-3-4.03 2.42Z'/><path d='m7 16.5-4.74-2.85'/><path d='m7 16.5 5-3'/><path d='M7 16.5v5.17'/><path d='M12 13.5V19l3.97 2.38a2 2 0 0 0 2.06 0l3-1.8a2 2 0 0 0 .97-1.71v-3.24a2 2 0 0 0-.97-1.71L17 10.5l-5 3Z'/><path d='m17 16.5-5-3'/><path d='m17 16.5 4.74-2.85'/><path d='M17 16.5v5.17'/><path d='M7.97 4.42A2 2 0 0 0 7 6.13v4.37l5 3 5-3V6.13a2 2 0 0 0-.97-1.71l-3-1.8a2 2 0 0 0-2.06 0l-3 1.8Z'/><path d='M12 8 7.26 5.15'/><path d='m12 8 4.74-2.85'/><path d='M12 13.5V8'/></svg>"
+        }
+        5 => {
+            "<svg aria-hidden=true viewBox='0 0 24 24' fill=none stroke=currentColor stroke-width=2 stroke-linecap=round stroke-linejoin=round><path d='M10.268 21a2 2 0 0 0 3.464 0'/><path d='M3.262 15.326A1 1 0 0 0 4 17h16a1 1 0 0 0 .74-1.673C19.41 13.956 18 12.499 18 8A6 6 0 0 0 6 8c0 4.499-1.411 5.956-2.738 7.326'/></svg>"
+        }
+        6 => {
+            "<svg aria-hidden=true viewBox='0 0 24 24' fill=none stroke=currentColor stroke-width=2 stroke-linecap=round stroke-linejoin=round><circle cx=12 cy=12 r=10/><path d='M12 16v-4'/><path d='M12 8h.01'/></svg>"
+        }
+        7 => {
+            "<svg aria-hidden=true viewBox='0 0 24 24' fill=none stroke=currentColor stroke-width=2 stroke-linecap=round stroke-linejoin=round><path d='m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3'/><path d='M12 9v4'/><path d='M12 17h.01'/></svg>"
+        }
+        _ => "",
+    }
+}
+
+fn render_page(
+    html: &mut String,
+    page: &DisplayPage,
+    snapshot: &HealthSnapshot,
+    filesystem_labels: &[DisplayLabel],
+) {
     match page {
         DisplayPage::Overview => {
-            let _ = write!(html, "<p><b>{}</b><br>Host: ", snapshot.health.message());
-            push_html(html, snapshot.host_name());
             let running = snapshot
                 .guests
                 .guests()
                 .iter()
-                .filter(|guest| matches!(guest.status, servatory_protocol::GuestStatus::Running))
+                .filter(|guest| guest.status == GuestStatus::Running)
                 .count();
+            let days = snapshot.uptime_seconds / 86_400;
+            let hours = snapshot.uptime_seconds % 86_400 / 3_600;
+            html.push_str("<div class=overview-lead><span class=pulse></span><div><span class=label>Current state</span><strong class=");
+            html.push_str(level_class(snapshot.health.level));
+            html.push('>');
+            push_html(html, snapshot.health.message());
+            html.push_str("</strong></div></div><div class=overview-grid><div class=datum><span class=label>Host</span><strong>");
+            push_html(html, snapshot.host_name());
             let _ = write!(
                 html,
-                "<br>Uptime: {} days<br>Network: ",
-                snapshot.uptime_seconds / 86_400
+                "</strong></div><div class=datum><span class=label>Uptime</span><strong>{days}d {hours}h</strong></div><div class=datum><span class=label>Network</span><strong>"
             );
-            push_html(html, snapshot.network_interface());
+            if snapshot.network_interface().is_empty() {
+                html.push_str("No interface");
+            } else {
+                push_html(html, snapshot.network_interface());
+            }
             let _ = write!(
                 html,
-                " · {} Mbps<br>Guests: {running} running · {} total</p>",
+                "</strong><small>{} Mbps</small></div><div class=datum><span class=label>Guests</span><strong>{running} / {}</strong><small>running / total</small></div></div>",
                 snapshot.network_mbps,
-                snapshot.guests.guests().len()
+                snapshot.guests.guests().len(),
             );
         }
         DisplayPage::Resources => {
@@ -1050,79 +1117,264 @@ fn render_page(html: &mut String, page: &DisplayPage, snapshot: &HealthSnapshot)
             );
             let _ = write!(
                 html,
-                "<div class=fact><span class=label>Load average</span><strong>{:.2}</strong></div>",
+                "<div class=inline-stat><span class=label>Load average</span><strong>{:.2}</strong></div>",
                 f32::from(snapshot.load_average_x100) / 100.0
             );
         }
         DisplayPage::Storage { .. } => {
+            html.push_str("<div class=storage-grid><section class=subpanel><h3 class=section-title>Filesystems</h3>");
             for (index, usage) in snapshot.filesystems.iter().enumerate() {
-                render_metric(
-                    html,
-                    &format!("Filesystem {}", index + 1),
-                    usage.used_percent,
-                    &format!(
-                        "{} MiB available{}",
-                        usage.available_mib,
-                        if usage.mounted { "" } else { " · MISSING" }
-                    ),
-                );
+                let label = filesystem_labels
+                    .get(index)
+                    .map_or("Filesystem", DisplayLabel::as_str);
+                let detail = if usage.mounted {
+                    format!("{} available", format_capacity_mib(usage.available_mib))
+                } else {
+                    "MISSING".to_string()
+                };
+                render_metric(html, label, usage.used_percent, &detail);
             }
-            html.push_str("<table>");
+            html.push_str("</section><section class=subpanel><h3 class=section-title>SMART devices</h3><div class=table-list>");
+            if snapshot.smart.devices().is_empty() {
+                html.push_str("<p class=empty>Not configured</p>");
+            }
             for device in snapshot.smart.devices() {
-                html.push_str("<tr><td>");
+                html.push_str("<div class=table-row><strong>");
                 push_html(html, device.label());
                 let _ = write!(
                     html,
-                    " SMART<td>{:?}{}",
-                    device.status,
+                    "</strong><span class={}>{}{}",
+                    smart_status_class(device.status),
+                    smart_status_text(device.status),
                     device
                         .temperature_celsius
-                        .map_or_else(String::new, |temperature| format!(" · {temperature}°C"))
+                        .map_or_else(String::new, |temperature| format!(" · {temperature}°C")),
                 );
+                html.push_str("</span></div>");
             }
-            let _ = write!(
-                html,
-                "<tr><td>Backup<td>{:?}</table>",
-                snapshot.backup_job_status
-            );
+            html.push_str("</div></section></div><div class=backup-strip><span class=label>Proxmox backup</span><strong class=");
+            html.push_str(backup_status_class(snapshot.backup_job_status));
+            html.push('>');
+            push_html(html, &backup_status_text(snapshot));
+            html.push_str("</strong></div>");
         }
         DisplayPage::PowerNetwork { .. } => {
+            html.push_str("<div class=power-grid><section class=subpanel><h3 class=section-title>UPS</h3><div class=table-list><div class=table-row><strong>Status</strong><span class=");
+            html.push_str(ups_status_class(snapshot.ups.status));
+            html.push('>');
+            push_html(
+                html,
+                ups_status_text(snapshot.ups.status, snapshot.ups.stale),
+            );
+            html.push_str("</span></div><div class=table-row><strong>Battery</strong><span>");
             if let Some(battery) = snapshot.ups.battery_percent {
-                render_metric(html, "UPS battery", battery, "remaining");
+                let _ = write!(html, "{battery}%");
+            } else {
+                html.push('—');
             }
-            if let Some(load) = snapshot.ups.load_percent {
-                render_metric(html, "UPS load", load, "rated output");
+            html.push_str("</span></div><div class=table-row><strong>Load</strong><span>");
+            match (snapshot.ups.load_percent, snapshot.ups.estimated_watts) {
+                (Some(load), Some(watts)) => {
+                    let _ = write!(html, "{load}% · ~{watts} W");
+                }
+                (Some(load), None) => {
+                    let _ = write!(html, "{load}%");
+                }
+                (None, _) => html.push('—'),
+            }
+            html.push_str("</span></div><div class=table-row><strong>Runtime</strong><span>");
+            if let Some(seconds) = snapshot.ups.runtime_seconds {
+                push_html(html, &format_duration_compact(seconds));
+            } else {
+                html.push('—');
+            }
+            html.push_str("</span></div></div></section><section class=subpanel><h3 class=section-title>Ethernet</h3><div class=table-list><div class=table-row><strong>Interface</strong><span>");
+            if snapshot.network_interface().is_empty() {
+                html.push_str("Not found");
+            } else {
+                push_html(html, snapshot.network_interface());
             }
             let _ = write!(
                 html,
-                "<table><tr><td>UPS<td>{:?}<tr><td>Ethernet<td>{} · {} Mbps<tr><td>Internet<td>{:?}<tr><td>Host IPv4<td>{}.{}.{}.{}</table>",
-                snapshot.ups.status,
-                if snapshot.network_up { "up" } else { "down" },
+                "</span></div><div class=table-row><strong>Link</strong><span class={}>{} · {} Mbps</span></div><div class=table-row><strong>Internet</strong><span class={}>{}</span></div><div class=table-row><strong>Host IPv4</strong><span>{}.{}.{}.{}</span></div>",
+                if snapshot.network_up { "ok" } else { "crit" },
+                if snapshot.network_up { "UP" } else { "DOWN" },
                 snapshot.network_mbps,
-                snapshot.internet_status,
+                internet_status_class(snapshot.internet_status),
+                internet_status_text(snapshot.internet_status),
                 snapshot.ipv4[0],
                 snapshot.ipv4[1],
                 snapshot.ipv4[2],
-                snapshot.ipv4[3]
+                snapshot.ipv4[3],
             );
+            if snapshot.internet_status != InternetStatus::Reachable {
+                html.push_str("<div class=table-row><strong>Last reachable</strong><span>");
+                if let Some(seconds) = snapshot.last_internet_success_age_seconds {
+                    let _ = write!(html, "{} ago", format_duration_compact(seconds));
+                } else {
+                    html.push_str("Unknown");
+                }
+                html.push_str("</span></div>");
+            }
+            html.push_str("</div></section></div>");
         }
         DisplayPage::Guests { .. } => {
-            html.push_str("<table>");
+            html.push_str("<div class=guest-list>");
+            if snapshot.guests.guests().is_empty() {
+                html.push_str("<p class=empty>No guests reported</p>");
+            }
             for guest in snapshot.guests.guests() {
-                let _ = write!(html, "<tr><td>{}<td>", guest.vmid);
-                push_html(html, guest.name());
+                let memory_percent = if guest.memory_total_mib == 0 {
+                    0
+                } else {
+                    (u64::from(guest.memory_used_mib) * 100 / u64::from(guest.memory_total_mib))
+                        .min(100) as u8
+                };
                 let _ = write!(
                     html,
-                    "<td>{:?}<td>{}% CPU · {} / {} MiB<div class=bar><i style='width:{}%'></i></div>",
-                    guest.status,
+                    "<div class=guest-row><span class=guest-id>#{}</span><div class=guest-name><strong>",
+                    guest.vmid
+                );
+                push_html(html, guest.name());
+                html.push_str("</strong><small>");
+                html.push_str(match guest.kind {
+                    GuestKind::VirtualMachine => "Virtual machine",
+                    GuestKind::Container => "Container",
+                });
+                let _ = write!(
+                    html,
+                    "</small></div><span class='guest-state {}'>{}</span><div class=guest-usage><span><b>CPU</b><b>{}%</b></span><div class=bar><i style='width:{}%'></i></div><span><b>Memory</b><b>{} / {} MiB</b></span><div class=bar><i style='width:{}%'></i></div></div></div>",
+                    if guest.status == GuestStatus::Running {
+                        "ok"
+                    } else {
+                        "crit"
+                    },
+                    if guest.status == GuestStatus::Running {
+                        "RUNNING"
+                    } else {
+                        "STOPPED"
+                    },
                     guest.cpu_percent,
+                    guest.cpu_percent.min(100),
                     guest.memory_used_mib,
                     guest.memory_total_mib,
-                    guest.cpu_percent
+                    memory_percent,
                 );
             }
-            html.push_str("</table>");
+            html.push_str("</div>");
         }
+    }
+}
+
+fn format_capacity_mib(mebibytes: u32) -> String {
+    if mebibytes >= 1_048_576 {
+        let tenths = u64::from(mebibytes) * 10 / 1_048_576;
+        format!("{}.{} TiB", tenths / 10, tenths % 10)
+    } else if mebibytes >= 1_024 {
+        let tenths = u64::from(mebibytes) * 10 / 1_024;
+        format!("{}.{} GiB", tenths / 10, tenths % 10)
+    } else {
+        format!("{mebibytes} MiB")
+    }
+}
+
+fn format_duration_compact(seconds: u32) -> String {
+    if seconds >= 86_400 {
+        format!("{}d {}h", seconds / 86_400, seconds % 86_400 / 3_600)
+    } else if seconds >= 3_600 {
+        format!("{}h {}m", seconds / 3_600, seconds % 3_600 / 60)
+    } else {
+        format!("{}m", seconds / 60)
+    }
+}
+
+fn backup_status_text(snapshot: &HealthSnapshot) -> String {
+    match snapshot.backup_job_status {
+        BackupJobStatus::Healthy => snapshot.last_successful_backup_age_seconds.map_or_else(
+            || "Healthy".to_string(),
+            |seconds| format!("Healthy · {} ago", format_duration_compact(seconds)),
+        ),
+        BackupJobStatus::Running => "Running".to_string(),
+        BackupJobStatus::Failed => "Failed".to_string(),
+        BackupJobStatus::Stale => snapshot.last_successful_backup_age_seconds.map_or_else(
+            || "Overdue".to_string(),
+            |seconds| format!("{} old", format_duration_compact(seconds)),
+        ),
+        BackupJobStatus::NoJob => "No job".to_string(),
+        BackupJobStatus::Unknown => "Unknown".to_string(),
+    }
+}
+
+const fn backup_status_class(status: BackupJobStatus) -> &'static str {
+    match status {
+        BackupJobStatus::Healthy => "ok",
+        BackupJobStatus::Running => "ok",
+        BackupJobStatus::Failed | BackupJobStatus::Stale | BackupJobStatus::NoJob => "warn",
+        BackupJobStatus::Unknown => "crit",
+    }
+}
+
+const fn smart_status_text(status: SmartStatus) -> &'static str {
+    match status {
+        SmartStatus::Healthy => "HEALTHY",
+        SmartStatus::Warning => "WARNING",
+        SmartStatus::Failed => "FAILED",
+        SmartStatus::Sleeping => "SLEEPING",
+        SmartStatus::Unknown => "UNKNOWN",
+    }
+}
+
+const fn smart_status_class(status: SmartStatus) -> &'static str {
+    match status {
+        SmartStatus::Healthy => "ok",
+        SmartStatus::Sleeping => "",
+        SmartStatus::Warning | SmartStatus::Unknown => "warn",
+        SmartStatus::Failed => "crit",
+    }
+}
+
+const fn ups_status_text(status: UpsStatus, stale: bool) -> &'static str {
+    if stale && !matches!(status, UpsStatus::Unavailable) {
+        return "STALE";
+    }
+    match status {
+        UpsStatus::NotConfigured => "NOT CONFIGURED",
+        UpsStatus::Unknown | UpsStatus::Unavailable => "NO DATA",
+        UpsStatus::Online => "ONLINE",
+        UpsStatus::OnBattery => "ON BATTERY",
+        UpsStatus::LowBattery => "LOW BATTERY",
+        UpsStatus::Charging => "CHARGING",
+        UpsStatus::Bypass => "BYPASS",
+        UpsStatus::OutputOff => "OUTPUT OFF",
+        UpsStatus::ReplaceBattery => "REPLACE BATTERY",
+    }
+}
+
+const fn ups_status_class(status: UpsStatus) -> &'static str {
+    match status {
+        UpsStatus::Online | UpsStatus::Charging => "ok",
+        UpsStatus::NotConfigured => "",
+        UpsStatus::OnBattery | UpsStatus::Bypass | UpsStatus::Unknown | UpsStatus::Unavailable => {
+            "warn"
+        }
+        UpsStatus::LowBattery | UpsStatus::OutputOff | UpsStatus::ReplaceBattery => "crit",
+    }
+}
+
+const fn internet_status_text(status: InternetStatus) -> &'static str {
+    match status {
+        InternetStatus::Reachable => "REACHABLE",
+        InternetStatus::Checking => "CHECKING",
+        InternetStatus::Missed => "RETRYING",
+        InternetStatus::Failed => "FAILED",
+    }
+}
+
+const fn internet_status_class(status: InternetStatus) -> &'static str {
+    match status {
+        InternetStatus::Reachable => "ok",
+        InternetStatus::Checking | InternetStatus::Missed => "warn",
+        InternetStatus::Failed => "crit",
     }
 }
 

@@ -47,6 +47,9 @@ IP address assigned to the stick by the router instead.
 The responsive dashboard follows the view order under `outputs.http.views`.
 It presents the same information as the LCD, but combines paginated disks and
 guests into continuous sections and uses compact utilization bars for resources.
+Filesystem names come from each `sources.filesystems[].label`, just as they do
+on the LCD. The Notifications card follows the configured views, and About is
+always the final card.
 An About card shows the firmware, daemon, protocol, hostname, and the stick's
 current DHCP address. A Notifications card shows the configured ntfy server and
 topic, provides a copy button, can send a test notification, and can generate a
