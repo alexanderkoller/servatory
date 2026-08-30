@@ -2480,7 +2480,7 @@ dependencies = [
 
 [[package]]
 name = "servatory-firmware"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "allocator-api2",
  "base64 0.21.7",
@@ -2521,7 +2521,7 @@ dependencies = [
 
 [[package]]
 name = "servatory-protocol"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cobs",
  "postcard",

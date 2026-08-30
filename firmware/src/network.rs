@@ -955,7 +955,7 @@ fn dashboard_markup(state: &SharedState, document: bool) -> String {
         .unwrap_or(HealthLevel::Healthy);
     let mut html = DashboardBuffer::new();
     if document {
-        html.push_str("<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta name=theme-color content='#08131d'><title>Servatory status</title><link rel=stylesheet href=/dashboard.css><script defer src=/dashboard.js></script>");
+        html.push_str("<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta name=theme-color content='#f2f6f8'><title>Servatory status</title><link rel=stylesheet href=/dashboard.css><script defer src=/dashboard.js></script>");
         let _ = write!(html, "</head><body class={}>", level_class(level));
     }
     let age_text = age.map_or_else(
