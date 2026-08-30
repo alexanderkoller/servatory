@@ -59,6 +59,7 @@ const MDNS_BUFFER_SIZE: usize = 768;
 const NOTIFICATION_TLS_RX_SIZE: usize = 16_384;
 const NOTIFICATION_TLS_TX_SIZE: usize = 4_096;
 const NOTIFICATION_RESPONSE_SIZE: usize = 1_024;
+const DASHBOARD_SCRIPT: &str = concat!("<script>", include_str!("dashboard.js"), "</script>");
 const ISRG_ROOT_X1: &str = concat!(
     "MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw",
     "TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh",
@@ -826,6 +827,15 @@ fn active_incidents(state: &SharedState) -> Vec<Incident> {
     incidents
 }
 
+fn notifiable_incidents(state: &SharedState) -> Vec<Incident> {
+    active_incidents(state)
+        .into_iter()
+        .filter(|incident| {
+            state.snapshot.is_some() || incident.id != IncidentId::Stick(StickIncident::HostOffline)
+        })
+        .collect()
+}
+
 fn dashboard_html(state: &SharedState) -> String {
     let incidents = active_incidents(state);
     let age = snapshot_age(state).map(|age| age.as_secs());
@@ -837,7 +847,7 @@ fn dashboard_html(state: &SharedState) -> String {
         .unwrap_or(HealthLevel::Healthy);
     let mut html = String::from(
         "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>\
-         <meta http-equiv=refresh content=5><style>\
+         <style>\
          *{box-sizing:border-box}:root{color-scheme:light;--bg:#f3f6fa;--panel:#fff;--line:#dfe7ef;--muted:#68798a;--text:#152536}\
          body{--accent:#16805d;--soft:#e6f5ef;margin:0;background:radial-gradient(circle at 92% 0,#e5f1ff 0,transparent 30rem),var(--bg);color:var(--text);font:15px ui-sans-serif,system-ui,-apple-system,sans-serif;min-height:100vh;border-top:4px solid var(--accent)}\
          body.warn{--accent:#a86400;--soft:#fff3d6}body.crit{--accent:#c7384b;--soft:#ffeaed}.shell{width:min(74rem,100%);margin:auto;padding:clamp(1rem,3vw,2.5rem)}\
@@ -846,8 +856,9 @@ fn dashboard_html(state: &SharedState) -> String {
          h1{position:relative;z-index:1;font-size:clamp(2.6rem,8vw,5.5rem);line-height:.95;letter-spacing:-.05em;margin:.65rem 0;color:var(--accent)}h2{font-size:1rem;margin:0;color:#203448}.card-head{display:flex;align-items:center;gap:.7rem;margin-bottom:1.1rem}.card-head h2{margin:0}.icon{display:grid;place-items:center;width:2.15rem;height:2.15rem;border-radius:.65rem;background:#edf4fa;color:#32617f;font-size:1.05rem;font-weight:800}\
          p{color:#66788a}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(19rem,100%),1fr));gap:1rem}.card{border-radius:.9rem;padding:1.2rem;min-width:0}.wide{grid-column:1/-1}.facts{display:grid;gap:.7rem}.fact{display:grid;grid-template-columns:7rem minmax(0,1fr);gap:.7rem;padding-bottom:.65rem;border-bottom:1px solid var(--line)}.fact:last-child{border:0;padding-bottom:0}.fact strong{font:650 .86rem ui-monospace,SFMono-Regular,monospace;overflow-wrap:anywhere}\
          .topic{display:block;color:#135e4a;background:#f2f8f5;border:1px solid #cde4da;border-radius:.55rem;padding:.8rem;margin:.5rem 0 1rem;overflow-wrap:anywhere;user-select:all}.metric{margin:.85rem 0}.metric-row{display:flex;justify-content:space-between;gap:1rem;margin-bottom:.35rem}.bar{height:.48rem;background:#e7edf3;border-radius:1rem;overflow:hidden}.bar i{display:block;height:100%;background:linear-gradient(90deg,#3b82c4,var(--accent));border-radius:inherit}\
-         button{appearance:none;border:1px solid #b9c7d5;border-radius:.55rem;background:#fff;color:#21384b;padding:.65rem .85rem;font-weight:750;cursor:pointer;margin:.2rem .35rem .2rem 0}button:hover{border-color:var(--accent);color:var(--accent);background:var(--soft)}table{width:100%;border-collapse:collapse;font-size:.9rem}td{padding:.55rem .25rem;border-bottom:1px solid var(--line);vertical-align:top}td:last-child{text-align:right;color:#2b4356}.ok{color:#16805d}.warn{color:#a86400}.crit{color:#c7384b}ul{padding-left:1.2rem}li{padding:.25rem}small{color:var(--muted)}@media(max-width:500px){.fact{grid-template-columns:1fr;gap:.15rem}.shell{padding:.8rem}.hero{border-radius:.8rem}}</style>",
+         button{appearance:none;border:1px solid #b9c7d5;border-radius:.55rem;background:#fff;color:#21384b;padding:.65rem .85rem;font-weight:750;cursor:pointer;margin:.2rem .35rem .2rem 0}button:hover{border-color:var(--accent);color:var(--accent);background:var(--soft)}button:disabled{cursor:wait;opacity:.75}.test-feedback{display:inline-block;min-width:5rem;color:var(--muted);font-size:.82rem;font-weight:700}.sending:before{content:'';display:inline-block;width:.75rem;height:.75rem;margin-right:.45rem;border:2px solid #b9c7d5;border-top-color:var(--accent);border-radius:50%;vertical-align:-.12rem;animation:spin .7s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}table{width:100%;border-collapse:collapse;font-size:.9rem}td{padding:.55rem .25rem;border-bottom:1px solid var(--line);vertical-align:top}td:last-child{text-align:right;color:#2b4356}.ok{color:#16805d}.warn{color:#a86400}.crit{color:#c7384b}ul{padding-left:1.2rem}li{padding:.25rem}small{color:var(--muted)}@media(max-width:500px){.fact{grid-template-columns:1fr;gap:.15rem}.shell{padding:.8rem}.hero{border-radius:.8rem}}</style>",
     );
+    html.push_str(DASHBOARD_SCRIPT);
     let _ = write!(
         html,
         "<body class={}><div class=shell><header class=hero><div class=live>{}</div>\
@@ -949,7 +960,7 @@ fn render_device_panels(html: &mut String, state: &SharedState) {
     );
     html.push_str("<div class=fact><span class=label>Server</span><strong>");
     push_html(html, server);
-    html.push_str("</strong></div></div><form method=post action=/api/v1/notifications/test><button>Send test notification</button></form><button type=button onclick=\"if(confirm('Generate a new topic? Existing ntfy subscriptions will stop receiving Servatory alerts.'))fetch('/api/v1/notifications/topic/regenerate',{method:'POST',headers:{'X-Servatory-Action':'regenerate'}}).then(()=>location.reload())\">Generate new topic</button></section>");
+    html.push_str("</strong></div></div><button data-client-state type=button onclick=\"sendTestNotification(this)\">Send test notification</button><span data-client-state id=test-feedback class=test-feedback aria-live=polite></span><br><button type=button onclick=\"if(confirm('Generate a new topic? Existing ntfy subscriptions will stop receiving Servatory alerts.'))fetch('/api/v1/notifications/topic/regenerate',{method:'POST',headers:{'X-Servatory-Action':'regenerate'}}).then(()=>location.reload())\">Generate new topic</button></section>");
 }
 
 const fn page_icon(kind: usize) -> &'static str {
@@ -1223,7 +1234,7 @@ async fn notification_worker(stack: Stack<'static>, mut seed: u64) {
     let mut next_critical_repeat = None;
     loop {
         let state = STATE.lock().await.clone();
-        let current = active_incidents(&state);
+        let current = notifiable_incidents(&state);
         if let Some(config) = state.manifest.as_ref().map(|manifest| &manifest.ntfy)
             && config.enabled
         {

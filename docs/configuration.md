@@ -412,7 +412,7 @@ outputs:
     priorities: { warning: high, critical: urgent, recovery: default }
     notify_recovery: true
     repeat_critical: 1h
-    click_url: http://servatory/
+    click_url: http://servatory.local/
 ```
 
 `outputs.stick.lcd.views` selects reusable view IDs and sets their button order.

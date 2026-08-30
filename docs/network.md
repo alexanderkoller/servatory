@@ -54,8 +54,8 @@ new random topic. Topic generation writes the replacement to flash immediately
 and switches subsequent notifications without Wi-Fi reprovisioning. Existing
 ntfy subscriptions must be changed to the newly displayed topic. The page also
 shows whether the feed is live, its age, and the complete active-incident list.
-It refreshes every five seconds and does not load scripts, fonts, libraries, or
-other assets from the Internet.
+Dashboard values update in place every five seconds without reloading the page.
+It does not load scripts, fonts, libraries, or other assets from the Internet.
 
 When the HTTP server is enabled and DHCP has assigned an address, the Stick's
 About screen shows a QR code for the dashboard root URL. The adjacent LCD text
