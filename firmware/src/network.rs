@@ -4,10 +4,17 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
-use core::{cell::RefCell, fmt::Write as _, net::Ipv4Addr};
+use core::{
+    cell::RefCell,
+    fmt::{Debug, Display, Write as _},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use critical_section::Mutex as CriticalMutex;
+use edge_http::{Method as HttpMethod, io::server::Connection as HttpConnection};
+use edge_mdns::{HostAnswersMdnsHandler, host::Host};
+use edge_nal::{TcpBind, UdpSplit, WithTimeout};
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
 use embassy_net::{
@@ -20,7 +27,7 @@ use embassy_net::{
 };
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel, mutex::Mutex};
 use embassy_time::{Duration, Instant, Timer};
-use embedded_io_async::Write;
+use embedded_io_async::{Read, Write};
 use esp_hal::rng::Rng;
 use esp_radio::wifi::{
     AuthenticationMethod, Config as WifiConfig, ControllerConfig, Interface, WifiController,
@@ -34,12 +41,24 @@ use servatory_protocol::{
     DisplayPage, HealthLevel, HealthSnapshot, Incident, IncidentId, NetworkConfig,
     NotificationPriority, PROTOCOL_VERSION, SoftwareVersion, StickIncident,
 };
+use static_cell::StaticCell;
 
-use crate::provisioning::{Provisioning, Store, StoredSettings};
+use crate::{
+    memory::{PsramBox, zeroed_psram},
+    provisioning::{Provisioning, Store, StoredSettings},
+};
 
 const PROVISIONING_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 4, 1);
 const HOST_STALE_AFTER: Duration = Duration::from_secs(15);
 const MAX_PENDING_NOTIFICATIONS: usize = 8;
+const HTTP_WORKERS: usize = 2;
+const HTTP_IO_TIMEOUT_MS: u32 = 2_000;
+const HTTP_BUFFER_SIZE: usize = 1_536;
+const HTTP_SOCKET_BUFFER_SIZE: usize = 1_024;
+const MDNS_BUFFER_SIZE: usize = 768;
+const NOTIFICATION_TLS_RX_SIZE: usize = 16_384;
+const NOTIFICATION_TLS_TX_SIZE: usize = 4_096;
+const NOTIFICATION_RESPONSE_SIZE: usize = 1_024;
 const ISRG_ROOT_X1: &str = concat!(
     "MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw",
     "TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh",
@@ -103,6 +122,25 @@ static STATION_IPV4: CriticalMutex<RefCell<Option<Ipv4Addr>>> =
     CriticalMutex::new(RefCell::new(None));
 static WEB_SERVER_PORT: CriticalMutex<RefCell<Option<u16>>> =
     CriticalMutex::new(RefCell::new(None));
+static STATION_STACK_RESOURCES: StaticCell<StackResources<10>> = StaticCell::new();
+static PROVISIONING_STACK_RESOURCES: StaticCell<StackResources<6>> = StaticCell::new();
+static HTTP_TCP_BUFFERS: StaticCell<
+    edge_nal_embassy::TcpBuffers<HTTP_WORKERS, HTTP_SOCKET_BUFFER_SIZE, HTTP_SOCKET_BUFFER_SIZE>,
+> = StaticCell::new();
+static HTTP_SERVER: StaticCell<edge_http::io::server::Server<HTTP_WORKERS, HTTP_BUFFER_SIZE, 16>> =
+    StaticCell::new();
+static MDNS_UDP_BUFFERS: StaticCell<
+    edge_nal_embassy::UdpBuffers<1, MDNS_BUFFER_SIZE, MDNS_BUFFER_SIZE, 2>,
+> = StaticCell::new();
+static MDNS_RECV_BUFFER: StaticCell<
+    edge_mdns::buf::VecBufAccess<CriticalSectionRawMutex, MDNS_BUFFER_SIZE>,
+> = StaticCell::new();
+static MDNS_SEND_BUFFER: StaticCell<
+    edge_mdns::buf::VecBufAccess<CriticalSectionRawMutex, MDNS_BUFFER_SIZE>,
+> = StaticCell::new();
+static MDNS_BROADCAST_SIGNAL: StaticCell<
+    embassy_sync::signal::Signal<CriticalSectionRawMutex, ()>,
+> = StaticCell::new();
 
 #[derive(Clone)]
 pub struct ProvisioningDisplay {
@@ -189,6 +227,12 @@ fn start_station(
 ) {
     let stored_network = settings.network;
     let provisioning = settings.provisioning;
+    let mut dhcp_hostname = heapless08::String::new();
+    dhcp_hostname
+        .push_str(&provisioning.hostname)
+        .expect("validated hostname fits DHCP option 12");
+    let mut dhcp = embassy_net::DhcpConfig::default();
+    dhcp.hostname = Some(dhcp_hostname);
     let station = StationConfig::default()
         .with_ssid(provisioning.ssid.as_str())
         .with_password(provisioning.password.as_str().into());
@@ -205,8 +249,8 @@ fn start_station(
     .expect("Wi-Fi station initialization");
     let (stack, runner) = embassy_net::new(
         interfaces.station,
-        embassy_net::Config::dhcpv4(Default::default()),
-        make_static(StackResources::<8>::new()),
+        embassy_net::Config::dhcpv4(dhcp),
+        STATION_STACK_RESOURCES.init(StackResources::new()),
         seed,
     );
     spawner.spawn(station_connection(controller).unwrap());
@@ -273,7 +317,7 @@ fn start_provisioning(
     let (stack, runner) = embassy_net::new(
         interfaces.access_point,
         config,
-        make_static(StackResources::<6>::new()),
+        PROVISIONING_STACK_RESOURCES.init(StackResources::new()),
         seed,
     );
     let mut display_ssid = heapless::String::new();
@@ -433,7 +477,7 @@ fn provisioning_page(ntfy_topic: &str) -> String {
          <h1>Servatory Wi-Fi setup</h1><form method=post action=/configure>\
          <label>Wi-Fi network<input class=box name=ssid maxlength=32 required></label>\
          <label>Wi-Fi password<input class=box name=password type=password maxlength=63></label>\
-         <label>Device hostname<input class=box name=hostname value=servatory maxlength=63 required></label>\
+         <label>Device hostname<input class=box name=hostname value=servatory maxlength=32 required></label>\
          <label>ntfy topic<input id=topic class=box name=ntfy_topic value='{ntfy_topic}' maxlength=128 required></label>\
          <button class=copy type=button onclick=\"let t=document.getElementById('topic');t.select();document.execCommand('copy')\">Copy topic</button>\
          <p>This random topic is private. Copy it into the ntfy app, or replace it here.</p>\
@@ -489,10 +533,9 @@ const fn hex(byte: u8) -> Option<u8> {
 #[embassy_executor::task]
 async fn http_server(stack: Stack<'static>) {
     stack.wait_config_up().await;
-    let mut rx = [0_u8; 2048];
-    let mut tx = [0_u8; 1536];
-    let mut socket = TcpSocket::new(stack, &mut rx, &mut tx);
-    socket.set_timeout(Some(Duration::from_secs(15)));
+    let tcp_buffers = HTTP_TCP_BUFFERS.init(edge_nal_embassy::TcpBuffers::new());
+    let tcp = edge_nal_embassy::Tcp::new(stack, tcp_buffers);
+    let server = HTTP_SERVER.init(edge_http::io::server::Server::new());
     loop {
         let (enabled, port) = {
             let state = STATE.lock().await;
@@ -506,51 +549,102 @@ async fn http_server(stack: Stack<'static>) {
             Timer::after_secs(1).await;
             continue;
         }
-        if socket
-            .accept(IpListenEndpoint { addr: None, port })
+        let Ok(acceptor) = tcp
+            .bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port))
             .await
-            .is_err()
-        {
+        else {
+            Timer::after_secs(1).await;
             continue;
+        };
+        let _ = server
+            .run(
+                Some(HTTP_IO_TIMEOUT_MS),
+                WithTimeout::new(HTTP_IO_TIMEOUT_MS, acceptor),
+                HttpHandler,
+            )
+            .await;
+        Timer::after_secs(1).await;
+    }
+}
+
+struct HttpHandler;
+
+impl edge_http::io::server::Handler for HttpHandler {
+    type Error<E>
+        = edge_http::io::Error<E>
+    where
+        E: Debug;
+
+    async fn handle<T, const N: usize>(
+        &self,
+        _task_id: impl Display + Copy,
+        connection: &mut HttpConnection<'_, T, N>,
+    ) -> Result<(), Self::Error<T::Error>>
+    where
+        T: Read + Write + edge_nal::TcpSplit,
+    {
+        let (method, path, regenerate) = {
+            let headers = connection.headers()?;
+            (
+                headers.method,
+                headers.path,
+                headers
+                    .headers
+                    .get("X-Servatory-Action")
+                    .is_some_and(|value| value.eq_ignore_ascii_case("regenerate")),
+            )
+        };
+
+        if method == HttpMethod::Post
+            && path == "/api/v1/notifications/topic/regenerate"
+            && regenerate
+        {
+            let topic = random_ntfy_topic();
+            STATE.lock().await.ntfy_topic = Some(topic.clone());
+            if let Err(embassy_sync::channel::TrySendError::Full(topic)) =
+                TOPIC_UPDATES.try_send(topic)
+            {
+                let _ = TOPIC_UPDATES.try_receive();
+                let _ = TOPIC_UPDATES.try_send(topic);
+            }
+            return write_http_response(
+                connection,
+                200,
+                "OK",
+                "text/html; charset=utf-8",
+                "<!doctype html><meta http-equiv=refresh content='0;url=/'><p>New ntfy topic generated and saved.</p>",
+            )
+            .await;
         }
-        let mut request = [0_u8; 1024];
-        let len = read_request(&mut socket, &mut request).await;
-        let request = core::str::from_utf8(&request[..len]).unwrap_or("");
-        let path = request.split_whitespace().nth(1).unwrap_or("/");
+
+        if method == HttpMethod::Post && path == "/api/v1/notifications/test" {
+            let _ = TEST_NOTIFICATIONS.try_send(());
+            return write_http_response(
+                connection,
+                202,
+                "Accepted",
+                "text/plain; charset=utf-8",
+                "Test notification queued.\n",
+            )
+            .await;
+        }
+
+        if method != HttpMethod::Get {
+            return write_http_response(
+                connection,
+                405,
+                "Method Not Allowed",
+                "text/plain; charset=utf-8",
+                "Method not allowed.\n",
+            )
+            .await;
+        }
+
         let state = STATE.lock().await.clone();
         match path {
-            "/api/v1/notifications/topic/regenerate"
-                if request.starts_with("POST ") && has_regenerate_header(request) =>
-            {
-                let topic = random_ntfy_topic();
-                STATE.lock().await.ntfy_topic = Some(topic.clone());
-                if let Err(embassy_sync::channel::TrySendError::Full(topic)) =
-                    TOPIC_UPDATES.try_send(topic)
-                {
-                    let _ = TOPIC_UPDATES.try_receive();
-                    let _ = TOPIC_UPDATES.try_send(topic);
-                }
-                write_response(
-                    &mut socket,
-                    "200 OK",
-                    "text/html; charset=utf-8",
-                    "<!doctype html><meta http-equiv=refresh content='0;url=/'><p>New ntfy topic generated and saved.</p>",
-                )
-                .await;
-            }
-            "/api/v1/notifications/test" if request.starts_with("POST ") => {
-                let _ = TEST_NOTIFICATIONS.try_send(());
-                write_response(
-                    &mut socket,
-                    "202 Accepted",
-                    "text/plain; charset=utf-8",
-                    "Test notification queued.\n",
-                )
-                .await;
-            }
             "/api/v1/health" => {
                 let body = health_json(&state);
-                write_response(&mut socket, "200 OK", "application/json", &body).await;
+                write_http_response(connection, 200, "OK", "application/json", &body).await?;
             }
             "/api/v1/device" => {
                 let age = snapshot_age(&state)
@@ -567,72 +661,101 @@ async fn http_server(stack: Stack<'static>) {
                     "{{\"firmware\":\"{}\",\"daemon\":\"{daemon}\",\"protocol\":{PROTOCOL_VERSION},\"wifi\":\"connected\",\"ipv4\":\"{address}\",\"snapshot_age_seconds\":{age}}}",
                     env!("SERVATORY_BUILD_VERSION"),
                 );
-                write_response(&mut socket, "200 OK", "application/json", &body).await;
+                write_http_response(connection, 200, "OK", "application/json", &body).await?;
             }
             "/healthz" => {
-                write_response(&mut socket, "200 OK", "text/plain", "ok\n").await;
+                write_http_response(connection, 200, "OK", "text/plain", "ok\n").await?;
             }
             _ => {
                 let body = dashboard_html(&state);
-                write_response(&mut socket, "200 OK", "text/html; charset=utf-8", &body).await;
+                write_http_response(connection, 200, "OK", "text/html; charset=utf-8", &body)
+                    .await?;
             }
         }
-        close_socket(&mut socket).await;
+        Ok(())
     }
+}
+
+async fn write_http_response<T, const N: usize>(
+    connection: &mut HttpConnection<'_, T, N>,
+    status: u16,
+    reason: &str,
+    content_type: &str,
+    body: &str,
+) -> Result<(), edge_http::io::Error<T::Error>>
+where
+    T: Read + Write,
+{
+    connection
+        .initiate_response(
+            status,
+            Some(reason),
+            &[
+                ("Content-Type", content_type),
+                ("Cache-Control", "no-store"),
+                ("Connection", "Close"),
+            ],
+        )
+        .await?;
+    connection.write_all(body.as_bytes()).await?;
+    Ok(())
 }
 
 #[embassy_executor::task]
 async fn mdns_responder(stack: Stack<'static>, hostname: String) {
-    use core::net::{IpAddr, SocketAddr};
-    use embassy_net::udp::{PacketMetadata, UdpSocket};
+    use edge_mdns::{buf::VecBufAccess, domain::base::Ttl, io};
+    use edge_nal_embassy::{Udp, UdpBuffers};
+    use embassy_sync::signal::Signal;
 
-    const MDNS: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
-    stack.wait_config_up().await;
-    let _ = stack.join_multicast_group(MDNS);
-    let rx_meta = make_static([PacketMetadata::EMPTY; 2]);
-    let tx_meta = make_static([PacketMetadata::EMPTY; 2]);
-    let rx_buffer = make_static([0_u8; 768]);
-    let tx_buffer = make_static([0_u8; 768]);
-    let mut socket = UdpSocket::new(stack, rx_meta, rx_buffer, tx_meta, tx_buffer);
-    if socket.bind(5353).is_err() {
-        return;
-    }
-    let name = dns_name(&format!("{}.local", hostname));
-    let mut request = [0_u8; 768];
+    let udp_buffers = MDNS_UDP_BUFFERS.init(UdpBuffers::new());
+    let recv_buf = MDNS_RECV_BUFFER.init(VecBufAccess::new());
+    let send_buf = MDNS_SEND_BUFFER.init(VecBufAccess::new());
+    let broadcast_signal = MDNS_BROADCAST_SIGNAL.init(Signal::new());
+    let udp = Udp::new(stack, udp_buffers);
+
     loop {
-        let Ok((len, _)) = socket.recv_from(&mut request).await else {
+        stack.wait_config_up().await;
+        let Some(ipv4) = stack.config_v4().map(|config| config.address.address()) else {
             continue;
         };
-        if !request[..len]
-            .windows(name.len())
-            .any(|window| window == name)
+        let Ok(mut socket) = io::bind(
+            &udp,
+            io::IPV4_DEFAULT_SOCKET,
+            Some(ipv4),
+            None,
+        )
+        .await
+        else {
+            Timer::after_secs(1).await;
+            continue;
+        };
+        let (recv, send) = socket.split();
+        let host = Host {
+            hostname: &hostname,
+            ipv4,
+            ipv6: Ipv6Addr::UNSPECIFIED,
+            ttl: Ttl::from_secs(120),
+        };
+        let mdns = io::Mdns::new(
+            Some(ipv4),
+            None,
+            recv,
+            send,
+            &*recv_buf,
+            &*send_buf,
+            Rng::new(),
+            &*broadcast_signal,
+        );
+        match select(
+            mdns.run(HostAnswersMdnsHandler::new(&host)),
+            stack.wait_config_down(),
+        )
+        .await
         {
-            continue;
+            Either::First(_) => Timer::after_secs(1).await,
+            Either::Second(_) => {}
         }
-        let Some(address) = stack.config_v4().map(|config| config.address.address()) else {
-            continue;
-        };
-        let mut response = Vec::with_capacity(64 + name.len());
-        response.extend_from_slice(&[0, 0, 0x84, 0, 0, 0, 0, 1, 0, 0, 0, 0]);
-        response.extend_from_slice(&name);
-        response.extend_from_slice(&[0, 1, 0, 1]);
-        response.extend_from_slice(&120_u32.to_be_bytes());
-        response.extend_from_slice(&[0, 4]);
-        response.extend_from_slice(&address.octets());
-        let _ = socket
-            .send_to(&response, SocketAddr::new(IpAddr::V4(MDNS), 5353))
-            .await;
     }
-}
-
-fn dns_name(value: &str) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(value.len() + 2);
-    for label in value.split('.') {
-        encoded.push(u8::try_from(label.len()).unwrap_or(0));
-        encoded.extend_from_slice(label.as_bytes());
-    }
-    encoded.push(0);
-    encoded
 }
 
 async fn read_request(socket: &mut TcpSocket<'_>, buffer: &mut [u8]) -> usize {
@@ -827,13 +950,6 @@ fn render_device_panels(html: &mut String, state: &SharedState) {
     html.push_str("<div class=fact><span class=label>Server</span><strong>");
     push_html(html, server);
     html.push_str("</strong></div></div><form method=post action=/api/v1/notifications/test><button>Send test notification</button></form><button type=button onclick=\"if(confirm('Generate a new topic? Existing ntfy subscriptions will stop receiving Servatory alerts.'))fetch('/api/v1/notifications/topic/regenerate',{method:'POST',headers:{'X-Servatory-Action':'regenerate'}}).then(()=>location.reload())\">Generate new topic</button></section>");
-}
-
-fn has_regenerate_header(request: &str) -> bool {
-    request.lines().any(|line| {
-        line.trim()
-            .eq_ignore_ascii_case("X-Servatory-Action: regenerate")
-    })
 }
 
 const fn page_icon(kind: usize) -> &'static str {
@@ -1079,9 +1195,26 @@ struct PendingNotification {
     recovery: bool,
 }
 
+struct NotificationWorkspace {
+    tls_rx: PsramBox<[u8]>,
+    tls_tx: PsramBox<[u8]>,
+    response: PsramBox<[u8]>,
+}
+
+impl NotificationWorkspace {
+    fn new() -> Self {
+        Self {
+            tls_rx: zeroed_psram(NOTIFICATION_TLS_RX_SIZE),
+            tls_tx: zeroed_psram(NOTIFICATION_TLS_TX_SIZE),
+            response: zeroed_psram(NOTIFICATION_RESPONSE_SIZE),
+        }
+    }
+}
+
 #[embassy_executor::task]
 async fn notification_worker(stack: Stack<'static>, mut seed: u64) {
     stack.wait_config_up().await;
+    let mut workspace = NotificationWorkspace::new();
     let tcp_state = make_static(TcpClientState::<1, 4096, 4096>::new());
     let tcp = TcpClient::new(stack, tcp_state);
     let dns = DnsSocket::new(stack);
@@ -1170,7 +1303,17 @@ async fn notification_worker(stack: Stack<'static>, mut seed: u64) {
                 (pending.front().cloned(), state.ntfy_topic.as_deref())
             {
                 seed = seed.wrapping_add(1);
-                if publish_notification(&tcp, &dns, config, topic, &notification, seed).await {
+                if publish_notification(
+                    &tcp,
+                    &dns,
+                    config,
+                    topic,
+                    &notification,
+                    seed,
+                    &mut workspace,
+                )
+                .await
+                {
                     pending.pop_front();
                 }
             }
@@ -1194,6 +1337,7 @@ async fn publish_notification(
     topic: &str,
     notification: &PendingNotification,
     seed: u64,
+    workspace: &mut NotificationWorkspace,
 ) -> bool {
     let url = format!("{}/{}", config.server().trim_end_matches('/'), topic);
     let priority = match notification.priority {
@@ -1206,16 +1350,14 @@ async fn publish_notification(
     } else {
         "Servatory incident"
     };
-    let mut tls_rx = [0_u8; 16_384];
-    let mut tls_tx = [0_u8; 4_096];
     let ca = match STANDARD.decode(ISRG_ROOT_X1) {
         Ok(ca) => ca,
         Err(_) => return false,
     };
     let tls = TlsConfig::new(
         seed,
-        &mut tls_rx,
-        &mut tls_tx,
+        workspace.tls_rx.as_mut(),
+        workspace.tls_tx.as_mut(),
         TlsVerify::Certificate {
             ca: &ca,
             cert: None,
@@ -1242,9 +1384,8 @@ async fn publish_notification(
     let mut request = request
         .headers(&headers)
         .body(notification.message.as_bytes());
-    let mut response = [0_u8; 1024];
     request
-        .send(&mut response)
+        .send(workspace.response.as_mut())
         .await
         .is_ok_and(|response| response.status.is_successful())
 }

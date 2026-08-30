@@ -10,10 +10,9 @@ use core::{
 };
 
 use embedded_graphics::{
-    framebuffer::{Framebuffer, buffer_size},
     image::Image,
     mono_font::{MonoTextStyle, ascii::FONT_6X10, ascii::FONT_10X20},
-    pixelcolor::{Rgb565, raw::BigEndian},
+    pixelcolor::Rgb565,
     prelude::*,
     primitives::{Arc, Line, PrimitiveStyleBuilder, Rectangle},
     text::Text,
@@ -45,10 +44,12 @@ use servatory_protocol::{
     InternetStatus, MAX_FRAME_LEN, PROTOCOL_VERSION, ProtocolError, ShutdownFailure, ShutdownPhase,
     SmartDeviceSummary, SmartStatus, SoftwareVersion, UpsStatus, decode_host, encode_device,
 };
-use static_cell::StaticCell;
-
+mod framebuffer;
+mod memory;
 mod network;
 mod provisioning;
+
+use framebuffer::ScreenBuffer;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -56,15 +57,6 @@ const PANEL_WIDTH: u16 = 135;
 const PANEL_HEIGHT: u16 = 240;
 const DISPLAY_WIDTH: u16 = 240;
 const DISPLAY_HEIGHT: u16 = 135;
-type ScreenBuffer = Framebuffer<
-    Rgb565,
-    <Rgb565 as PixelColor>::Raw,
-    BigEndian,
-    240,
-    135,
-    { buffer_size::<Rgb565>(240, 135) },
->;
-static SCREEN_BUFFER: StaticCell<ScreenBuffer> = StaticCell::new();
 static SHOW_ABOUT: AtomicBool = AtomicBool::new(false);
 // M5Stack does not publish controller RAM offsets; these match this 135x240 panel family.
 const DISPLAY_OFFSET_X: u16 = 52;
@@ -266,6 +258,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     let peripherals = esp_hal::init(config);
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 64 * 1024);
     esp_alloc::heap_allocator!(size: 48 * 1024);
+    let _psram = memory::initialize_psram(peripherals.PSRAM);
     let timer_group = TimerGroup::new(peripherals.TIMG0);
     let software_interrupts = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     esp_rtos::start(timer_group.timer0, software_interrupts.software_interrupt0);
@@ -304,7 +297,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         .reset_pin(reset)
         .init(&mut delay)
         .expect("display initialization");
-    let framebuffer = SCREEN_BUFFER.init(ScreenBuffer::new());
+    let framebuffer = &mut ScreenBuffer::new();
     backlight.set_high();
 
     // KEY1 is the front button used for navigation and shutdown.

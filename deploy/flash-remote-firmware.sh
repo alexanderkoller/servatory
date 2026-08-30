@@ -105,6 +105,7 @@ firmware_binary=$firmware_dir/target/$firmware_target/release/servatory-firmware
 
 echo "Building release firmware locally..."
 (cd "$firmware_dir" && cargo build --locked --release)
+"$firmware_dir/scripts/check-memory-layout.sh" "$firmware_binary"
 
 tool_dir=$repo_dir/target/remote-tools/espflash-$ESPFLASH_VERSION/$espflash_target
 archive=$tool_dir/espflash.zip

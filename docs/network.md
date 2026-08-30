@@ -13,7 +13,7 @@ and the address `192.168.4.1`. Connect a phone or computer to that open network,
 open `http://192.168.4.1/`, and enter:
 
 - the normal Wi-Fi network and password;
-- the device hostname, normally `servatory`;
+- the device hostname, normally `servatory` (up to 32 characters);
 - the generated ntfy topic, or a replacement of your choice.
 
 The setup network is intentionally temporary and has no password. It provides
@@ -33,10 +33,16 @@ avoid placing sensitive infrastructure details in health messages.
 
 ## Open the dashboard
 
-The default dashboard is available at `http://servatory.local/`. Servatory
-answers mDNS queries for the hostname selected during provisioning. If the
-network filters multicast DNS, use the IP address assigned to the stick by the
-router instead.
+The default dashboard is available at `http://servatory/` when the router
+registers DHCP hostnames in its local DNS. Servatory sends the hostname selected
+during provisioning as DHCP option 12; clients normally expand the bare name
+using the router-provided DNS search domain. For example, a Fritz!Box may resolve
+`servatory` through `servatory.fritz.box`.
+
+The stick also advertises `http://servatory.local/` using multicast DNS. This is
+the infrastructure-independent fallback on the same network link. If the router
+does not register DHCP hostnames and the network filters multicast DNS, use the
+IP address assigned to the stick by the router instead.
 
 The responsive dashboard follows the view order under `outputs.http.views`.
 It presents the same information as the LCD, but combines paginated disks and

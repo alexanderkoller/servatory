@@ -29,7 +29,7 @@ impl Provisioning {
             && self.ssid.len() <= 32
             && self.password.len() <= 63
             && !self.hostname.is_empty()
-            && self.hostname.len() <= 63
+            && self.hostname.len() <= 32
             && self
                 .hostname
                 .bytes()

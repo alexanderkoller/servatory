@@ -222,4 +222,4 @@ outputs:
       recovery: default
     notify_recovery: true
     repeat_critical: 1h
-    click_url: http://servatory.local/
+    click_url: http://servatory/
