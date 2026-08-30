@@ -1,70 +1,28 @@
-let dashboardRefreshInProgress = false;
-
-function reconcileDashboardNode(current, fresh) {
-    if (current.nodeType !== fresh.nodeType || current.nodeName !== fresh.nodeName) {
-        current.replaceWith(fresh.cloneNode(true));
-        return;
-    }
-    if (current.nodeType === Node.TEXT_NODE) {
-        if (current.data !== fresh.data) current.data = fresh.data;
-        return;
-    }
-    if (
-        current.nodeType !== Node.ELEMENT_NODE
-        || current.matches('[data-client-state],script')
-    ) return;
-
-    for (const attribute of [...current.attributes]) {
-        if (!fresh.hasAttribute(attribute.name)) current.removeAttribute(attribute.name);
-    }
-    for (const attribute of [...fresh.attributes]) {
-        if (current.getAttribute(attribute.name) !== attribute.value) {
-            current.setAttribute(attribute.name, attribute.value);
-        }
-    }
-
-    let currentChild = current.firstChild;
-    let freshChild = fresh.firstChild;
-    while (currentChild || freshChild) {
-        if (!currentChild) {
-            current.append(freshChild.cloneNode(true));
-            freshChild = freshChild.nextSibling;
-            continue;
-        }
-        if (!freshChild) {
-            const next = currentChild.nextSibling;
-            currentChild.remove();
-            currentChild = next;
-            continue;
-        }
-        const nextCurrent = currentChild.nextSibling;
-        const nextFresh = freshChild.nextSibling;
-        reconcileDashboardNode(currentChild, freshChild);
-        currentChild = nextCurrent;
-        freshChild = nextFresh;
-    }
-}
+let dashboardBusy = false;
 
 async function refreshDashboard() {
-    if (dashboardRefreshInProgress) return;
-    dashboardRefreshInProgress = true;
+    if (dashboardBusy || document.hidden) return;
+    dashboardBusy = true;
     try {
-        const response = await fetch('/', { cache: 'no-store' });
+        const response = await fetch('/api/v1/dashboard-fragment', { cache: 'no-store' });
         if (!response.ok) throw new Error('dashboard refresh failed');
-        const fresh = new DOMParser().parseFromString(await response.text(), 'text/html');
+        const template = document.createElement('template');
+        template.innerHTML = await response.text();
+        const freshShell = template.content.querySelector('.shell');
         const currentShell = document.querySelector('.shell');
-        const freshShell = fresh.querySelector('.shell');
-        if (!currentShell || !freshShell) throw new Error('dashboard content missing');
-        reconcileDashboardNode(currentShell, freshShell);
-        document.body.className = fresh.body.className;
+        if (!freshShell || !currentShell) throw new Error('dashboard content missing');
+        document.body.className = freshShell.dataset.bodyClass;
+        currentShell.replaceWith(freshShell);
     } catch (_) {
         // Keep the last usable dashboard visible; the next interval retries.
     } finally {
-        dashboardRefreshInProgress = false;
+        dashboardBusy = false;
     }
 }
 
 async function sendTestNotification(button) {
+    if (dashboardBusy) return;
+    dashboardBusy = true;
     const status = document.getElementById('test-feedback');
     button.disabled = true;
     status.className = 'test-feedback sending';
@@ -82,10 +40,9 @@ async function sendTestNotification(button) {
         button.disabled = false;
         status.className = 'test-feedback';
         status.textContent = '';
+        dashboardBusy = false;
     }, 2000);
 }
 
 setInterval(refreshDashboard, 5000);
-document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) refreshDashboard();
-});
+document.addEventListener('visibilitychange', refreshDashboard);

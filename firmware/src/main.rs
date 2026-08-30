@@ -4,10 +4,8 @@
 
 extern crate alloc;
 
-use core::{
-    fmt::Write as _,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use alloc::sync::Arc as Shared;
+use core::fmt::Write as _;
 
 use embedded_graphics::{
     image::Image,
@@ -39,10 +37,11 @@ use mipidsi::{
 };
 use qrcodegen_no_heap::{QrCode, QrCodeEcc, Version};
 use servatory_protocol::{
-    BackupJobStatus, ButtonAction, DeviceMessage, DisplayConfig, DisplayPage, FilesystemUsage,
-    FrameDecoder, GuestKind, GuestStatus, HandshakeNonce, HealthLevel, HealthSnapshot, HostMessage,
-    InternetStatus, MAX_FRAME_LEN, PROTOCOL_VERSION, ProtocolError, ShutdownFailure, ShutdownPhase,
-    SmartDeviceSummary, SmartStatus, SoftwareVersion, UpsStatus, decode_host, encode_device,
+    BackupJobStatus, DeviceMessage, DisplayConfig, DisplayPage, FilesystemUsage, FrameDecoder,
+    GuestKind, GuestStatus, HandshakeNonce, HealthLevel, HealthSnapshot, HostMessage,
+    InternetStatus, MAX_DEVICE_FRAME_LEN, MAX_HOST_FRAME_LEN, PROTOCOL_VERSION, ProtocolError,
+    ShutdownFailure, ShutdownPhase, SmartDeviceSummary, SmartStatus, SoftwareVersion, UpsStatus,
+    decode_host, encode_device,
 };
 mod framebuffer;
 mod memory;
@@ -57,7 +56,6 @@ const PANEL_WIDTH: u16 = 135;
 const PANEL_HEIGHT: u16 = 240;
 const DISPLAY_WIDTH: u16 = 240;
 const DISPLAY_HEIGHT: u16 = 135;
-static SHOW_ABOUT: AtomicBool = AtomicBool::new(false);
 // M5Stack does not publish controller RAM offsets; these match this 135x240 panel family.
 const DISPLAY_OFFSET_X: u16 = 52;
 const DISPLAY_OFFSET_Y: u16 = 40;
@@ -69,7 +67,6 @@ const USB_ACTIVITY_TIMEOUT: Duration = Duration::from_millis(250);
 const SHUTDOWN_SPINNER_INTERVAL: Duration = Duration::from_millis(250);
 const SHUTDOWN_REPORT_TIMEOUT: Duration = Duration::from_secs(3);
 const SHUTDOWN_USB_LOST_CONFIRM: Duration = Duration::from_secs(2);
-const MAX_DEVICE_FRAME_LEN: usize = 64;
 const GUESTS_PER_PAGE: usize = 4;
 const M5PM1_ADDRESS: u8 = 0x6e;
 const M5PM1_GPIO2_MASK: u8 = 1 << 2;
@@ -81,6 +78,12 @@ enum DaemonState {
     Stale,
     Incompatible,
     PoweringOff,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ButtonAction {
+    NextScreen,
+    ShutdownRequested,
 }
 
 #[derive(Clone, Copy)]
@@ -139,14 +142,11 @@ impl UsbTx {
     }
 
     fn enqueue(&mut self, message: DeviceMessage) {
-        let is_shutdown = matches!(
-            &message,
-            DeviceMessage::Button(ButtonAction::ShutdownRequested)
-        );
+        let is_shutdown = matches!(&message, DeviceMessage::ShutdownRequested);
         if let Err(message) = self.queue.push_back(message)
             && is_shutdown
         {
-            // A shutdown request is more important than an old acknowledgement.
+            // A shutdown request is more important than an old repeated hello.
             self.queue.pop_front();
             let _ = self.queue.push_back(message);
         }
@@ -313,7 +313,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     )
     .await;
     let mut usb = UsbSerialJtag::new(peripherals.USB_DEVICE);
-    let mut decoder = FrameDecoder::<MAX_FRAME_LEN>::new();
+    let mut decoder = FrameDecoder::<MAX_HOST_FRAME_LEN>::new();
     let mut usb_tx = UsbTx::new();
     let mut button = Button::new(Instant::now());
     let mut daemon = DaemonState::Waiting;
@@ -331,6 +331,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     let mut last_hello = None;
     let mut last_short_click = None;
     let mut daemon_session = None;
+    let mut show_about = false;
 
     // Render before attempting any USB traffic so offline operation always works.
     render(
@@ -342,12 +343,13 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         &health_snapshot,
         &display_config,
         shutdown_display,
+        show_about,
     );
     usb_tx.enqueue(device_hello(None));
-    usb_tx.enqueue(DeviceMessage::Ready);
 
     loop {
         let now = Instant::now();
+        let mut render_pending = false;
         if daemon != DaemonState::Connected
             && daemon != DaemonState::PoweringOff
             && last_hello.is_none_or(|sent| now - sent >= HELLO_INTERVAL)
@@ -365,16 +367,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
             && daemon == DaemonState::Waiting
             && !shutdown_animation_active
         {
-            render(
-                &mut display,
-                framebuffer,
-                usb_connected,
-                daemon,
-                page,
-                &health_snapshot,
-                &display_config,
-                shutdown_display,
-            );
+            render_pending = true;
         }
 
         while let Ok(byte) = usb.read_byte() {
@@ -392,95 +385,26 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                     network::update_daemon_version(daemon_version.clone()).await;
                     display_config.daemon_version = daemon_version;
                     usb_tx.enqueue(device_hello(daemon_session));
-                    if !shutdown_animation_active {
-                        render(
-                            &mut display,
-                            framebuffer,
-                            usb_connected,
-                            daemon,
-                            page,
-                            &health_snapshot,
-                            &display_config,
-                            shutdown_display,
-                        );
-                    }
+                    render_pending = true;
                 }
                 Ok(_) if daemon_session.is_none() => {
                     // Ignore session data until the daemon has supplied a
                     // challenge that this Stick has acknowledged.
                 }
-                Ok(HostMessage::Update { sequence, .. }) => {
+                Ok(HostMessage::HealthSnapshot(snapshot)) => {
                     last_update = Some(now);
-                    // ShutdownAccepted is terminal only for the old host session.
-                    // A subsequent valid update proves that the host is running again.
-                    daemon = DaemonState::Connected;
-                    usb_tx.enqueue(DeviceMessage::Ack { sequence });
-                    if !shutdown_animation_active {
-                        render(
-                            &mut display,
-                            framebuffer,
-                            usb_connected,
-                            daemon,
-                            page,
-                            &health_snapshot,
-                            &display_config,
-                            shutdown_display,
-                        );
-                    }
-                }
-                Ok(HostMessage::GuestSnapshot { sequence, .. }) => {
-                    last_update = Some(now);
-                    daemon = DaemonState::Connected;
-                    usb_tx.enqueue(DeviceMessage::Ack { sequence });
-                    if !shutdown_animation_active {
-                        render(
-                            &mut display,
-                            framebuffer,
-                            usb_connected,
-                            daemon,
-                            page,
-                            &health_snapshot,
-                            &display_config,
-                            shutdown_display,
-                        );
-                    }
-                }
-                Ok(HostMessage::HealthSnapshot {
-                    sequence, snapshot, ..
-                }) => {
-                    last_update = Some(now);
-                    network::update_snapshot(snapshot.clone()).await;
+                    let snapshot = Shared::new(snapshot);
+                    network::update_snapshot(Shared::clone(&snapshot)).await;
                     health_snapshot = Some(snapshot);
                     daemon = DaemonState::Connected;
-                    usb_tx.enqueue(DeviceMessage::Ack { sequence });
-                    if !shutdown_animation_active {
-                        render(
-                            &mut display,
-                            framebuffer,
-                            usb_connected,
-                            daemon,
-                            page,
-                            &health_snapshot,
-                            &display_config,
-                            shutdown_display,
-                        );
-                    }
+                    render_pending = true;
                 }
                 Ok(HostMessage::ShutdownAccepted) => {
                     last_update = Some(now);
                     shutdown_usb_lost_since = None;
                     daemon = DaemonState::PoweringOff;
                     shutdown_display = ShutdownDisplay::Accepted;
-                    render(
-                        &mut display,
-                        framebuffer,
-                        usb_connected,
-                        daemon,
-                        page,
-                        &health_snapshot,
-                        &display_config,
-                        shutdown_display,
-                    );
+                    render_pending = true;
                 }
                 Ok(HostMessage::ShutdownProgress {
                     phase,
@@ -505,16 +429,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                             }
                         }
                     };
-                    render(
-                        &mut display,
-                        framebuffer,
-                        usb_connected,
-                        daemon,
-                        page,
-                        &health_snapshot,
-                        &display_config,
-                        shutdown_display,
-                    );
+                    render_pending = true;
                 }
                 Ok(HostMessage::ShutdownFailed {
                     reason,
@@ -525,50 +440,19 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                         reason,
                         remaining: guests_remaining,
                     };
-                    render(
-                        &mut display,
-                        framebuffer,
-                        usb_connected,
-                        daemon,
-                        page,
-                        &health_snapshot,
-                        &display_config,
-                        shutdown_display,
-                    );
+                    render_pending = true;
                 }
                 Ok(HostMessage::DisplayConfig(config)) => {
                     display_config = config;
                     page %= display_config.pages().len().max(1);
-                    if !shutdown_animation_active {
-                        render(
-                            &mut display,
-                            framebuffer,
-                            usb_connected,
-                            daemon,
-                            page,
-                            &health_snapshot,
-                            &display_config,
-                            shutdown_display,
-                        );
-                    }
+                    render_pending = true;
                 }
                 Ok(HostMessage::NetworkConfig(config)) => {
                     network::update_manifest(config).await;
                 }
                 Err(ProtocolError::UnsupportedVersion { .. }) => {
                     daemon = DaemonState::Incompatible;
-                    if !shutdown_animation_active {
-                        render(
-                            &mut display,
-                            framebuffer,
-                            usb_connected,
-                            daemon,
-                            page,
-                            &health_snapshot,
-                            &display_config,
-                            shutdown_display,
-                        );
-                    }
+                    render_pending = true;
                 }
                 Err(_) => {}
             }
@@ -579,18 +463,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         {
             daemon = DaemonState::Stale;
             daemon_session = None;
-            if !shutdown_animation_active {
-                render(
-                    &mut display,
-                    framebuffer,
-                    usb_connected,
-                    daemon,
-                    page,
-                    &health_snapshot,
-                    &display_config,
-                    shutdown_display,
-                );
-            }
+            render_pending = true;
         }
 
         let shutdown_hold = Duration::from_millis(u64::from(display_config.shutdown_hold_ms));
@@ -600,12 +473,13 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
             let canceled_shutdown = action == ButtonAction::NextScreen && shutdown_animation_active;
             if action == ButtonAction::NextScreen {
                 if !canceled_shutdown {
-                    if SHOW_ABOUT.swap(false, Ordering::Relaxed) {
+                    if show_about {
+                        show_about = false;
                         last_short_click = None;
                     } else if last_short_click
                         .is_some_and(|clicked| now - clicked <= DOUBLE_CLICK_WINDOW)
                     {
-                        SHOW_ABOUT.store(true, Ordering::Relaxed);
+                        show_about = true;
                         last_short_click = None;
                     } else {
                         page = (page + 1) % display_config.pages().len().max(1);
@@ -614,16 +488,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                 }
                 shutdown_animation_active = false;
                 shutdown_animation_height = 0;
-                render(
-                    &mut display,
-                    framebuffer,
-                    usb_connected,
-                    daemon,
-                    page,
-                    &health_snapshot,
-                    &display_config,
-                    shutdown_display,
-                );
+                render_pending = true;
             }
             // A recent decoded host update is the reliable session signal. The
             // USB SOF indicator is only advisory and may briefly read false even
@@ -638,22 +503,16 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                         !shutdown_animation_active,
                     );
                 } else if shutdown_animation_active {
-                    render(
-                        &mut display,
-                        framebuffer,
-                        usb_connected,
-                        daemon,
-                        page,
-                        &health_snapshot,
-                        &display_config,
-                        shutdown_display,
-                    );
+                    render_pending = true;
                 }
                 shutdown_animation_active = false;
                 shutdown_animation_height = 0;
             }
-            if daemon == DaemonState::Connected && !canceled_shutdown {
-                usb_tx.enqueue(DeviceMessage::Button(action));
+            if daemon == DaemonState::Connected
+                && !canceled_shutdown
+                && action == ButtonAction::ShutdownRequested
+            {
+                usb_tx.enqueue(DeviceMessage::ShutdownRequested);
             }
         } else if daemon == DaemonState::Connected
             && let Some(held) = button.held_for(now)
@@ -671,16 +530,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         } else if shutdown_animation_active {
             shutdown_animation_active = false;
             shutdown_animation_height = 0;
-            render(
-                &mut display,
-                framebuffer,
-                usb_connected,
-                daemon,
-                page,
-                &health_snapshot,
-                &display_config,
-                shutdown_display,
-            );
+            render_pending = true;
         }
 
         if daemon == DaemonState::PoweringOff
@@ -695,16 +545,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                     shutdown_display = ShutdownDisplay::ConnectionLost {
                         remaining: shutdown_remaining(shutdown_display),
                     };
-                    render(
-                        &mut display,
-                        framebuffer,
-                        usb_connected,
-                        daemon,
-                        page,
-                        &health_snapshot,
-                        &display_config,
-                        shutdown_display,
-                    );
+                    render_pending = true;
                 }
             }
         } else if daemon != DaemonState::PoweringOff {
@@ -720,16 +561,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
             shutdown_display = ShutdownDisplay::ReportingLost {
                 remaining: shutdown_remaining(shutdown_display),
             };
-            render(
-                &mut display,
-                framebuffer,
-                usb_connected,
-                daemon,
-                page,
-                &health_snapshot,
-                &display_config,
-                shutdown_display,
-            );
+            render_pending = true;
         }
 
         if daemon == DaemonState::PoweringOff
@@ -741,6 +573,10 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                 remaining,
             };
             last_shutdown_spinner = now;
+            render_pending = true;
+        }
+
+        if render_pending && !shutdown_animation_active {
             render(
                 &mut display,
                 framebuffer,
@@ -750,6 +586,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                 &health_snapshot,
                 &display_config,
                 shutdown_display,
+                show_about,
             );
         }
 
@@ -856,9 +693,10 @@ fn render<D>(
     usb_connected: bool,
     daemon: DaemonState,
     page: usize,
-    health_snapshot: &Option<HealthSnapshot>,
+    health_snapshot: &Option<Shared<HealthSnapshot>>,
     display_config: &DisplayConfig,
     shutdown_display: ShutdownDisplay,
+    show_about: bool,
 ) where
     D: DrawTarget<Color = Rgb565>,
 {
@@ -879,7 +717,7 @@ fn render<D>(
         .draw(framebuffer)
         .ok();
 
-    if SHOW_ABOUT.load(Ordering::Relaxed) && daemon != DaemonState::PoweringOff {
+    if show_about && daemon != DaemonState::PoweringOff {
         draw_about(framebuffer, display_config, accent);
         Image::new(&framebuffer.as_image(), Point::zero())
             .draw(display)
@@ -2384,14 +2222,8 @@ where
         ShutdownDisplay::Failed { reason, remaining } => {
             let mut detail = String::<32>::new();
             match reason {
-                ShutdownFailure::GuestQuery => {
-                    let _ = detail.push_str("Could not query guests");
-                }
-                ShutdownFailure::GuestShutdown => {
-                    let _ = write!(&mut detail, "{remaining} guests still running");
-                }
                 ShutdownFailure::HostPoweroff => {
-                    let _ = detail.push_str("Could not power off host");
+                    let _ = write!(&mut detail, "Poweroff failed, {remaining} remain");
                 }
             }
             draw_message(display, "SHUTDOWN FAILED", &detail, color);

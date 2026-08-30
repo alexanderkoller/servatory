@@ -9,6 +9,7 @@ use std::{
 };
 
 use serde_json::Value;
+use servatory_host::command_output;
 use servatory_protocol::{
     BackupJobStatus, FilesystemUsage, GuestKind, GuestSnapshot, GuestStatus, GuestSummary,
     HealthSnapshot, InternetStatus, SmartDeviceSummary, SmartSnapshot, SmartStatus, UpsSnapshot,
@@ -16,6 +17,21 @@ use servatory_protocol::{
 };
 
 use crate::config::{InternetConfig, SmartDeviceConfig};
+
+const NETWORK_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+const FILESYSTEM_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const UPS_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+const SMART_REFRESH_INTERVAL: Duration = Duration::from_mins(1);
+const BACKUP_REFRESH_INTERVAL: Duration = Duration::from_mins(1);
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn refresh_due(now: Instant, next_refresh: &mut Instant, interval: Duration) -> bool {
+    if now < *next_refresh {
+        return false;
+    }
+    *next_refresh = now + interval;
+    true
+}
 
 #[derive(Clone, Copy)]
 struct CpuTimes {
@@ -30,19 +46,17 @@ pub struct HealthCollector {
     smart_devices: Vec<SmartDeviceConfig>,
     filesystems: Vec<String>,
     backup_task_history_limit: u16,
-}
-
-impl Default for HealthCollector {
-    fn default() -> Self {
-        Self::new(
-            None,
-            2,
-            Vec::new(),
-            vec!["/".into(), "/mnt/pve/hdd".into(), "/mnt/pve/backup".into()],
-            None,
-            50,
-        )
-    }
+    host_name: String,
+    network: NetworkSnapshot,
+    filesystem_usage: Vec<FilesystemUsage>,
+    backup: (BackupJobStatus, Option<u32>),
+    ups_snapshot: UpsSnapshot,
+    smart: SmartSnapshot,
+    next_network_refresh: Instant,
+    next_filesystem_refresh: Instant,
+    next_backup_refresh: Instant,
+    next_ups_refresh: Instant,
+    next_smart_refresh: Instant,
 }
 
 impl HealthCollector {
@@ -55,6 +69,8 @@ impl HealthCollector {
         internet: Option<&InternetConfig>,
         backup_task_history_limit: u16,
     ) -> Self {
+        let now = Instant::now();
+        let filesystem_usage = vec![FilesystemUsage::MISSING; filesystems.len()];
         Self {
             previous_cpu: None,
             connectivity: ConnectivityProbe::new(internet),
@@ -62,6 +78,17 @@ impl HealthCollector {
             smart_devices,
             filesystems,
             backup_task_history_limit,
+            host_name: read_host_name(),
+            network: NetworkSnapshot::default(),
+            filesystem_usage,
+            backup: (BackupJobStatus::Unknown, None),
+            ups_snapshot: UpsSnapshot::NOT_CONFIGURED,
+            smart: SmartSnapshot::default(),
+            next_network_refresh: now,
+            next_filesystem_refresh: now,
+            next_backup_refresh: now,
+            next_ups_refresh: now,
+            next_smart_refresh: now,
         }
     }
 }
@@ -69,50 +96,68 @@ impl HealthCollector {
 impl HealthCollector {
     #[must_use]
     pub fn collect(&mut self) -> HealthSnapshot {
+        let now = Instant::now();
         let current_cpu = read_cpu_times();
         let cpu_percent = cpu_percent(self.previous_cpu, current_cpu);
         self.previous_cpu = current_cpu;
 
-        let host_name = read_host_name();
         let (memory_used_mib, memory_total_mib) = read_memory();
-        let network = read_network();
+        if refresh_due(
+            now,
+            &mut self.next_network_refresh,
+            NETWORK_REFRESH_INTERVAL,
+        ) {
+            self.network = read_network();
+        }
         let (internet_status, last_internet_success_age_seconds) =
-            self.connectivity.snapshot(network.up);
-        let filesystems = self
-            .filesystems
-            .iter()
-            .map(|path| read_filesystem_usage(path))
-            .collect();
-        let (backup_job_status, last_successful_backup_age_seconds) = read_backup_job_status(
-            &host_name,
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .ok()
-                .map(|duration| duration.as_secs()),
-            self.backup_task_history_limit,
-        );
-        let ups = self.ups.collect();
-        let smart = read_smart(&self.smart_devices);
+            self.connectivity.snapshot(self.network.up);
+        if refresh_due(
+            now,
+            &mut self.next_filesystem_refresh,
+            FILESYSTEM_REFRESH_INTERVAL,
+        ) {
+            self.filesystem_usage = self
+                .filesystems
+                .iter()
+                .map(|path| read_filesystem_usage(path))
+                .collect();
+        }
+        if refresh_due(now, &mut self.next_backup_refresh, BACKUP_REFRESH_INTERVAL) {
+            self.backup = read_backup_job_status(
+                &self.host_name,
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .ok()
+                    .map(|duration| duration.as_secs()),
+                self.backup_task_history_limit,
+            );
+        }
+        if refresh_due(now, &mut self.next_ups_refresh, UPS_REFRESH_INTERVAL) {
+            self.ups_snapshot = self.ups.collect();
+        }
+        if refresh_due(now, &mut self.next_smart_refresh, SMART_REFRESH_INTERVAL) {
+            self.smart = read_smart(&self.smart_devices);
+        }
         HealthSnapshot::new(
-            &host_name,
+            &self.host_name,
             read_uptime(),
             cpu_percent,
             memory_used_mib,
             memory_total_mib,
             read_io_pressure(),
             read_load_average(),
-            filesystems,
-            backup_job_status,
-            last_successful_backup_age_seconds,
-            network.up,
-            network.mbps,
-            &network.interface,
+            self.filesystem_usage.clone(),
+            self.backup.0,
+            self.backup.1,
+            self.network.up,
+            self.network.mbps,
+            &self.network.interface,
             internet_status,
             last_internet_success_age_seconds,
-            network.ipv4,
-            read_guests(&host_name),
-            ups,
-            smart,
+            self.network.ipv4,
+            read_guests(&self.host_name),
+            self.ups_snapshot,
+            self.smart.clone(),
         )
     }
 }
@@ -141,7 +186,7 @@ impl UpsCollector {
         let snapshot = ["/usr/bin/upsc", "/usr/sbin/upsc"]
             .iter()
             .find_map(|executable| {
-                let output = Command::new(executable).arg(target).output().ok()?;
+                let output = command_output(executable, &[target], COMMAND_TIMEOUT)?;
                 output
                     .status
                     .success()
@@ -232,10 +277,11 @@ fn read_smart_device(path: &str) -> (SmartStatus, Option<i8>) {
     let output = ["/usr/sbin/smartctl", "/usr/bin/smartctl"]
         .iter()
         .find_map(|executable| {
-            Command::new(executable)
-                .args(["-j", "-n", "standby", "-H", "-A", "-d", "sat", path])
-                .output()
-                .ok()
+            command_output(
+                executable,
+                &["-j", "-n", "standby", "-H", "-A", "-d", "sat", path],
+                COMMAND_TIMEOUT,
+            )
         });
     let Some(output) = output else {
         return (SmartStatus::Unknown, None);
@@ -377,10 +423,7 @@ fn read_load_average() -> u16 {
 }
 
 fn read_filesystem_usage(path: &str) -> FilesystemUsage {
-    let Ok(output) = Command::new("/usr/bin/df")
-        .args(["-P", "-k", path])
-        .output()
-    else {
+    let Some(output) = command_output("/usr/bin/df", &["-P", "-k", path], COMMAND_TIMEOUT) else {
         return FilesystemUsage::MISSING;
     };
     if !output.status.success() {
@@ -411,16 +454,18 @@ fn read_backup_job_status(
     let Some(now_seconds) = now_seconds else {
         return (BackupJobStatus::Unknown, None);
     };
-    let Ok(jobs) = Command::new("/usr/bin/pvesh")
-        .args(["get", "/cluster/backup", "--output-format", "json"])
-        .output()
-    else {
+    let Some(jobs) = command_output(
+        "/usr/bin/pvesh",
+        &["get", "/cluster/backup", "--output-format", "json"],
+        COMMAND_TIMEOUT,
+    ) else {
         return (BackupJobStatus::Unknown, None);
     };
     let task_path = format!("/nodes/{host_name}/tasks");
     let task_history_limit = task_history_limit.to_string();
-    let Ok(tasks) = Command::new("/usr/bin/pvesh")
-        .args([
+    let Some(tasks) = command_output(
+        "/usr/bin/pvesh",
+        &[
             "get",
             &task_path,
             "--typefilter",
@@ -431,9 +476,9 @@ fn read_backup_job_status(
             &task_history_limit,
             "--output-format",
             "json",
-        ])
-        .output()
-    else {
+        ],
+        COMMAND_TIMEOUT,
+    ) else {
         return (BackupJobStatus::Unknown, None);
     };
     if !jobs.status.success() || !tasks.status.success() {
@@ -722,10 +767,11 @@ fn read_network() -> NetworkSnapshot {
 
 fn read_route() -> Option<(String, [u8; 4])> {
     for executable in ["/usr/sbin/ip", "/usr/bin/ip"] {
-        let Ok(output) = Command::new(executable)
-            .args(["-4", "route", "get", "8.8.8.8"])
-            .output()
-        else {
+        let Some(output) = command_output(
+            executable,
+            &["-4", "route", "get", "8.8.8.8"],
+            COMMAND_TIMEOUT,
+        ) else {
             continue;
         };
         if output.status.success()
@@ -778,12 +824,13 @@ fn parse_default_route(routes: &str) -> Option<String> {
 
 fn read_interface_ipv4(interface: &str) -> [u8; 4] {
     for executable in ["/usr/sbin/ip", "/usr/bin/ip"] {
-        let Ok(output) = Command::new(executable)
-            .args([
+        let Some(output) = command_output(
+            executable,
+            &[
                 "-4", "-o", "address", "show", "dev", interface, "scope", "global",
-            ])
-            .output()
-        else {
+            ],
+            COMMAND_TIMEOUT,
+        ) else {
             continue;
         };
         if output.status.success()
@@ -874,17 +921,18 @@ fn read_link(sysfs: &Path, interface: &str) -> (bool, u16) {
 }
 
 fn read_guests(host_name: &str) -> GuestSnapshot {
-    let Ok(output) = Command::new("/usr/bin/pvesh")
-        .args([
+    let Some(output) = command_output(
+        "/usr/bin/pvesh",
+        &[
             "get",
             "/cluster/resources",
             "--type",
             "vm",
             "--output-format",
             "json",
-        ])
-        .output()
-    else {
+        ],
+        COMMAND_TIMEOUT,
+    ) else {
         return GuestSnapshot::default();
     };
     if !output.status.success() {
@@ -974,6 +1022,40 @@ fn parse_hundredths(value: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_output_enforces_deadline_and_captures_output() {
+        let output = command_output(
+            "/bin/sh",
+            &["-c", "printf captured"],
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"captured");
+
+        let started = Instant::now();
+        let output = command_output("/bin/sleep", &["1"], Duration::from_millis(20)).unwrap();
+        assert!(!output.status.success());
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn refresh_schedule_only_becomes_due_at_its_deadline() {
+        let now = Instant::now();
+        let mut next = now;
+        assert!(refresh_due(now, &mut next, Duration::from_secs(30)));
+        assert!(!refresh_due(
+            now + Duration::from_secs(29),
+            &mut next,
+            Duration::from_secs(30)
+        ));
+        assert!(refresh_due(
+            now + Duration::from_secs(30),
+            &mut next,
+            Duration::from_secs(30)
+        ));
+    }
 
     struct TempSysfs(std::path::PathBuf);
 

@@ -23,7 +23,7 @@ names do not silently fall back to another behavior.
 Every configuration contains these top-level sections:
 
 ```yaml
-version: 1
+version: 2
 host: ...
 connection: ...
 actions: ...
@@ -33,7 +33,11 @@ views: ...
 outputs: ...
 ```
 
-All sections are required. `version` must currently be `1`.
+All sections are required. `version` must currently be `2`.
+
+To migrate a version 1 file, remove `sources.system`, `sources.network`, and
+`sources.proxmox.node`, then set `version: 2`. Those fields only selected the
+single implementation that Servatory already used.
 
 Duration values are strings containing a non-negative integer followed by
 `ms`, `s`, `m`, or `h`. For example, `200ms`, `5s`, and `24h` are valid. A
@@ -82,19 +86,10 @@ fit in an unsigned 16-bit integer (at most 65,535 ms).
 
 ## Data sources
 
-The `sources` section tells the daemon what to measure. Its child sections are
-all required, even when a source has no configured items.
-
-### Host metrics
-
-```yaml
-sources:
-  system:
-    provider: procfs
-```
-
-`procfs` is the only supported provider. It supplies CPU use, memory use, load,
-uptime, and I/O pressure from the Linux host.
+The `sources` section tells the daemon what to measure. Host metrics always come
+from Linux procfs, and the network interface is always resolved from the default
+IPv4 route through any Proxmox bridge, bond, or VLAN. These fixed implementation
+choices no longer require configuration fields.
 
 ### Filesystems
 
@@ -152,19 +147,6 @@ After a successful query, a temporary failure retains the previous UPS values
 as stale. `failures_before_unavailable` sets the number of consecutive failures
 after which the UPS becomes unavailable; it must be positive.
 
-### Network interface
-
-```yaml
-sources:
-  network:
-    interface: default_ipv4_route
-    resolve_physical_interface: true
-```
-
-These are currently fixed compatibility values. The daemon finds the interface
-used by the default IPv4 route, then follows Proxmox bridges, bonds, and VLANs to
-the active physical port. Other values are rejected.
-
 ### Internet probe
 
 ```yaml
@@ -193,14 +175,12 @@ The target must be non-empty. All duration fields are required; `interval` and
 ```yaml
 sources:
   proxmox:
-    node: local_hostname
     backup:
       task_history_limit: 50
 ```
 
-`local_hostname` is currently the only supported node selection. The daemon
-queries enabled backup jobs and inspects up to `task_history_limit` recent
-tasks. The limit must be positive.
+The daemon queries the local Proxmox node, enabled backup jobs, and up to
+`task_history_limit` recent tasks. The limit must be positive.
 
 ## Health evaluation
 

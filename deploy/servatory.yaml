@@ -1,4 +1,4 @@
-version: 1
+version: 2
 
 host:
   update_interval: 5s
@@ -15,9 +15,6 @@ actions:
     animation_delay: 200ms
 
 sources:
-  system:
-    provider: procfs
-
   filesystems:
     - id: root
       path: /
@@ -41,10 +38,6 @@ sources:
     endpoint: eaton@localhost
     failures_before_unavailable: 2
 
-  network:
-    interface: default_ipv4_route
-    resolve_physical_interface: true
-
   internet:
     target: www.google.de
     interval: 30s
@@ -54,7 +47,6 @@ sources:
     failures_before_failed: 2
 
   proxmox:
-    node: local_hostname
     backup:
       task_history_limit: 50
 

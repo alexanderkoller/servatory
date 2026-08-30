@@ -1,12 +1,62 @@
-use std::{fs, io::Write, process::Command, thread, time::Duration};
+use std::{
+    fs,
+    io::{Read as _, Write},
+    process::{Command, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
 
 use serde_json::Value;
 use servatory_protocol::{
-    ButtonAction, DeviceMessage, HostMessage, MAX_FRAME_LEN, ShutdownFailure, ShutdownPhase,
-    encode_host,
+    DeviceMessage, HostMessage, MAX_HOST_FRAME_LEN, ShutdownFailure, ShutdownPhase, encode_host,
 };
 
 const SHUTDOWN_FAILURE_DISPLAY_TIME: Duration = Duration::from_secs(3);
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Runs a child process with captured output and a hard deadline.
+#[must_use]
+pub fn command_output(executable: &str, args: &[&str], timeout: Duration) -> Option<Output> {
+    let mut child = Command::new(executable)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let mut stderr = child.stderr.take()?;
+
+    thread::scope(|scope| {
+        let stdout_reader = scope.spawn(move || {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).ok()?;
+            Some(bytes)
+        });
+        let stderr_reader = scope.spawn(move || {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).ok()?;
+            Some(bytes)
+        });
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Ok(None) | Err(_) => {
+                    let _ = child.kill();
+                    break child.wait().ok()?;
+                }
+            }
+        };
+        Some(Output {
+            status,
+            stdout: stdout_reader.join().ok()??,
+            stderr: stderr_reader.join().ok()??,
+        })
+    })
+}
 
 pub trait Shutdown {
     /// Requests an orderly operating-system shutdown.
@@ -98,16 +148,19 @@ fn monitor_system_guest_shutdown(
 }
 
 fn running_guest_count(host_name: &str) -> anyhow::Result<u16> {
-    let output = Command::new("/usr/bin/pvesh")
-        .args([
+    let output = command_output(
+        "/usr/bin/pvesh",
+        &[
             "get",
             "/cluster/resources",
             "--type",
             "vm",
             "--output-format",
             "json",
-        ])
-        .output()?;
+        ],
+        COMMAND_TIMEOUT,
+    )
+    .ok_or_else(|| anyhow::anyhow!("could not execute pvesh guest query"))?;
     if !output.status.success() {
         anyhow::bail!("pvesh guest query exited with {}", output.status);
     }
@@ -183,7 +236,6 @@ fn write_shutdown_failure(
 pub struct EventHandler<S> {
     shutdown: S,
     allow_shutdown: bool,
-    session_established: bool,
 }
 
 impl<S: Shutdown> EventHandler<S> {
@@ -191,7 +243,6 @@ impl<S: Shutdown> EventHandler<S> {
         Self {
             shutdown,
             allow_shutdown,
-            session_established: false,
         }
     }
 
@@ -206,22 +257,8 @@ impl<S: Shutdown> EventHandler<S> {
         output: &mut impl Write,
     ) -> anyhow::Result<bool> {
         match message {
-            DeviceMessage::Ready => {
-                eprintln!("display transport ready; waiting for protocol handshake");
-                self.session_established = false;
-                Ok(false)
-            }
-            DeviceMessage::Hello { .. } | DeviceMessage::Button(ButtonAction::NextScreen) => {
-                Ok(false)
-            }
-            DeviceMessage::Ack { sequence } => {
-                if !self.session_established {
-                    eprintln!("display acknowledged update {sequence}; session established");
-                    self.session_established = true;
-                }
-                Ok(false)
-            }
-            DeviceMessage::Button(ButtonAction::ShutdownRequested) if self.allow_shutdown => {
+            DeviceMessage::Hello { .. } => Ok(false),
+            DeviceMessage::ShutdownRequested if self.allow_shutdown => {
                 write_host_message(HostMessage::ShutdownAccepted, output)?;
                 output.flush()?;
                 match self.shutdown.poweroff(output) {
@@ -232,7 +269,7 @@ impl<S: Shutdown> EventHandler<S> {
                     }
                 }
             }
-            DeviceMessage::Button(ButtonAction::ShutdownRequested) => {
+            DeviceMessage::ShutdownRequested => {
                 eprintln!("ignoring shutdown request: start with --allow-shutdown to enable it");
                 Ok(false)
             }
@@ -246,7 +283,7 @@ impl<S: Shutdown> EventHandler<S> {
 ///
 /// Returns an error if serialization or writing fails.
 pub fn write_host_message(message: HostMessage, output: &mut impl Write) -> anyhow::Result<()> {
-    let mut storage = [0_u8; MAX_FRAME_LEN];
+    let mut storage = [0_u8; MAX_HOST_FRAME_LEN];
     let frame = encode_host(message, &mut storage)
         .map_err(|error| anyhow::anyhow!("encoding host message: {error}"))?;
     output.write_all(frame)?;
@@ -275,10 +312,7 @@ mod tests {
         let mut handler = EventHandler::new(FakeShutdown::default(), false);
         assert!(
             !handler
-                .handle(
-                    &DeviceMessage::Button(ButtonAction::ShutdownRequested),
-                    &mut output
-                )
+                .handle(&DeviceMessage::ShutdownRequested, &mut output)
                 .unwrap()
         );
         assert!(output.is_empty());
@@ -291,10 +325,7 @@ mod tests {
         let mut handler = EventHandler::new(FakeShutdown::default(), true);
         assert!(
             handler
-                .handle(
-                    &DeviceMessage::Button(ButtonAction::ShutdownRequested),
-                    &mut output
-                )
+                .handle(&DeviceMessage::ShutdownRequested, &mut output)
                 .unwrap()
         );
         assert_eq!(

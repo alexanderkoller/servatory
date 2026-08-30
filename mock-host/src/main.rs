@@ -10,8 +10,8 @@ use serialport::{SerialPortInfo, SerialPortType};
 use servatory_host::{EventHandler, write_host_message};
 use servatory_mock_host::{ConsoleShutdown, made_up_health};
 use servatory_protocol::{
-    DeviceMessage, FrameDecoder, HandshakeNonce, HostMessage, MAX_FRAME_LEN, PROTOCOL_VERSION,
-    Sequence, SoftwareVersion, UnixSeconds, decode_device,
+    DeviceMessage, FrameDecoder, HandshakeNonce, HostMessage, MAX_DEVICE_FRAME_LEN,
+    PROTOCOL_VERSION, SoftwareVersion, decode_device,
 };
 
 const ESPRESSIF_VID: u16 = 0x303a;
@@ -40,8 +40,7 @@ fn main() -> Result<()> {
 
     let interval = Duration::from_secs(args.interval_seconds.max(1));
     let mut next_update = Instant::now();
-    let mut sequence = Sequence::ZERO;
-    let mut decoder = FrameDecoder::<MAX_FRAME_LEN>::new();
+    let mut decoder = FrameDecoder::<MAX_DEVICE_FRAME_LEN>::new();
     let mut handler = EventHandler::new(ConsoleShutdown::new(stderr()), true);
     let mut input = [0_u8; 64];
     let started = SystemTime::now()
@@ -65,20 +64,8 @@ fn main() -> Result<()> {
         }
 
         if handshake_established && Instant::now() >= next_update {
-            let unix_seconds = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .context("system clock is before the Unix epoch")?
-                .as_secs();
-            write_host_message(
-                HostMessage::HealthSnapshot {
-                    sequence,
-                    unix_seconds: UnixSeconds::new(unix_seconds),
-                    snapshot: made_up_health(),
-                },
-                &mut port,
-            )?;
-            eprintln!("sent mock health snapshot #{sequence}");
-            sequence = sequence.wrapping_next();
+            write_host_message(HostMessage::HealthSnapshot(made_up_health()), &mut port)?;
+            eprintln!("sent mock health snapshot");
             next_update = Instant::now() + interval;
         }
 

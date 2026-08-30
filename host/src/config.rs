@@ -10,9 +10,10 @@ use serde::{Deserialize, Deserializer};
 use serde_yaml::Value;
 use servatory_protocol::{
     BackupJobStatus, DisplayConfig, DisplayLabel, DisplayPage, DisplayView, HealthLevel,
-    HealthReport, HealthSnapshot, HostMessage, HttpConfig, Incident, IncidentId, MAX_FRAME_LEN,
-    NetworkConfig as DeviceNetworkConfig, NotificationPriority, NotificationSeverities, NtfyConfig,
-    RuleId, SmartStatus, SoftwareVersion, UpsStatus, encode_host,
+    HealthReport, HealthSnapshot, HostMessage, HttpConfig, Incident, IncidentId,
+    MAX_HOST_FRAME_LEN, NetworkConfig as DeviceNetworkConfig, NotificationPriority,
+    NotificationSeverities, NtfyConfig, RuleId, SmartStatus, SoftwareVersion, UpsStatus,
+    encode_host,
 };
 
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/servatory/config.yaml";
@@ -70,19 +71,11 @@ pub struct ShutdownConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourcesConfig {
-    pub system: SystemConfig,
     pub filesystems: Vec<FilesystemConfig>,
     pub smart: SmartConfig,
     pub ups: UpsConfig,
-    pub network: NetworkConfig,
     pub internet: InternetConfig,
     pub proxmox: ProxmoxConfig,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SystemConfig {
-    pub provider: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,15 +110,7 @@ pub struct UpsConfig {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct NetworkConfig {
-    pub interface: String,
-    pub resolve_physical_interface: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ProxmoxConfig {
-    pub node: String,
     pub backup: BackupConfig,
 }
 
@@ -206,7 +191,7 @@ pub enum Condition {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Predicate {
-    pub measurement: String,
+    pub measurement: MetricSelector,
     pub equals: Option<Value>,
     pub r#in: Option<Vec<Value>>,
     pub at_least: Option<f64>,
@@ -215,11 +200,101 @@ pub struct Predicate {
     pub missing_or_greater_than: Option<Duration>,
 }
 
+#[derive(Debug)]
+pub enum MetricSelector {
+    UpsStatus,
+    UpsStale,
+    SmartStatus,
+    NetworkUp,
+    InternetStatus,
+    BackupStatus,
+    BackupAge,
+    CpuPercent,
+    MemoryPercent,
+    IoPressurePercent,
+    Filesystem { id: String, field: FilesystemField },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum FilesystemField {
+    Mounted,
+    UsedPercent,
+}
+
+impl<'de> Deserialize<'de> for MetricSelector {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        let selector = match value.as_str() {
+            "ups.main.status" => Self::UpsStatus,
+            "ups.main.stale" => Self::UpsStale,
+            "smart.*.status" => Self::SmartStatus,
+            "network.uplink.up" => Self::NetworkUp,
+            "network.internet.status" => Self::InternetStatus,
+            "proxmox.backup.status" => Self::BackupStatus,
+            "proxmox.backup.last_success_age" => Self::BackupAge,
+            "system.cpu.percent" => Self::CpuPercent,
+            "system.memory.used_percent" => Self::MemoryPercent,
+            "system.io_pressure.percent" => Self::IoPressurePercent,
+            _ => {
+                if let Some((id, field)) = value
+                    .strip_prefix("filesystem.")
+                    .and_then(|rest| rest.rsplit_once('.'))
+                {
+                    let field = match field {
+                        "mounted" => FilesystemField::Mounted,
+                        "used_percent" => FilesystemField::UsedPercent,
+                        _ => {
+                            return Err(serde::de::Error::custom(format!(
+                                "unknown measurement {value:?}"
+                            )));
+                        }
+                    };
+                    Self::Filesystem {
+                        id: id.to_owned(),
+                        field,
+                    }
+                } else {
+                    return Err(serde::de::Error::custom(format!(
+                        "unknown measurement {value:?}"
+                    )));
+                }
+            }
+        };
+        Ok(selector)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ViewConfig {
     pub title: String,
-    pub layout: Value,
+    pub layout: ViewLayout,
+}
+
+#[derive(Debug)]
+pub enum ViewLayout {
+    Overview,
+    Resources,
+    Storage {
+        filesystem_ids: Vec<String>,
+        smart_ids: Vec<String>,
+        filesystems_left: bool,
+    },
+    PowerNetwork {
+        ups_left: bool,
+    },
+    Guests {
+        paginate: bool,
+        offset: u32,
+        limit: u32,
+    },
+}
+
+impl<'de> Deserialize<'de> for ViewLayout {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        parse_view_layout(&value).map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -311,7 +386,7 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.version != 1 {
+        if self.version != 2 {
             bail!("unsupported configuration version {}", self.version);
         }
         if self.host.update_interval.is_zero() {
@@ -360,18 +435,8 @@ impl Config {
         if self.sources.ups.failures_before_unavailable == 0 {
             bail!("UPS failures_before_unavailable must be positive");
         }
-        if self.sources.system.provider != "procfs" {
-            bail!("only the procfs system provider is currently supported");
-        }
-        if self.sources.network.interface != "default_ipv4_route"
-            || !self.sources.network.resolve_physical_interface
-        {
-            bail!("the current firmware requires the resolved default IPv4 route interface");
-        }
-        if self.sources.proxmox.node != "local_hostname"
-            || self.sources.proxmox.backup.task_history_limit == 0
-        {
-            bail!("invalid Proxmox node or backup history limit");
+        if self.sources.proxmox.backup.task_history_limit == 0 {
+            bail!("Proxmox backup history limit must be positive");
         }
         if self.sources.internet.target.is_empty()
             || self.sources.internet.interval.is_zero()
@@ -440,10 +505,10 @@ impl Config {
 
     fn validate_manifest_sizes(&self) -> Result<()> {
         let display = self.display_config(0)?;
-        let mut frame = vec![0_u8; MAX_FRAME_LEN];
+        let mut frame = vec![0_u8; MAX_HOST_FRAME_LEN];
         encode_host(HostMessage::DisplayConfig(display), &mut frame).map_err(|_| {
             anyhow::anyhow!(
-                "configured display manifest does not fit the {MAX_FRAME_LEN}-byte device frame budget"
+                "configured display manifest does not fit the {MAX_HOST_FRAME_LEN}-byte device frame budget"
             )
         })?;
         encode_host(
@@ -452,7 +517,7 @@ impl Config {
         )
         .map_err(|_| {
             anyhow::anyhow!(
-                "configured network manifest does not fit the {MAX_FRAME_LEN}-byte device frame budget"
+                "configured network manifest does not fit the {MAX_HOST_FRAME_LEN}-byte device frame budget"
             )
         })?;
         Ok(())
@@ -495,11 +560,8 @@ impl Config {
                 .get(id)
                 .with_context(|| format!("unknown LCD view {id:?}"))?;
             let title = DisplayLabel::new(&view.title);
-            if contains(&view.layout, "guest_list")
-                && find_bool(&view.layout, "paginate") == Some(true)
-            {
-                let count = guest_count.max(1).div_ceil(4);
-                for index in 0..count {
+            if let ViewLayout::Guests { paginate: true, .. } = &view.layout {
+                for index in 0..guest_count.max(1).div_ceil(4) {
                     pages.push(DisplayView::new(
                         title.clone(),
                         DisplayPage::Guests {
@@ -510,39 +572,35 @@ impl Config {
                 }
                 continue;
             }
-            if contains(&view.layout, "filesystems") && contains(&view.layout, "smart") {
-                let filesystem_ids = find_string_list(&view.layout, "filesystems")
-                    .context("storage view requires a filesystem ID list")?;
-                let smart_ids = find_string_list(&view.layout, "smart")
-                    .context("storage view requires a SMART device ID list")?;
-                let filesystem_ids_available: Vec<_> = self
-                    .sources
-                    .filesystems
-                    .iter()
-                    .map(|item| item.id.as_str())
-                    .collect();
-                let smart_ids_available: Vec<_> = self
-                    .sources
-                    .smart
-                    .devices
-                    .iter()
-                    .map(|item| item.id.as_str())
-                    .collect();
-                let filesystem_indices =
-                    resolve_indices(&filesystem_ids, &filesystem_ids_available, "filesystem")?;
-                let smart_indices =
-                    resolve_indices(&smart_ids, &smart_ids_available, "SMART device")?;
+            if let ViewLayout::Storage {
+                filesystem_ids,
+                smart_ids,
+                filesystems_left,
+            } = &view.layout
+            {
+                let filesystem_indices = resolve_indices(filesystem_ids, "filesystem", |id| {
+                    self.sources
+                        .filesystems
+                        .iter()
+                        .position(|item| item.id == id)
+                })?;
+                let smart_indices = resolve_indices(smart_ids, "SMART device", |id| {
+                    self.sources
+                        .smart
+                        .devices
+                        .iter()
+                        .position(|item| item.id == id)
+                })?;
                 let page_count = filesystem_indices
                     .len()
                     .div_ceil(3)
                     .max(smart_indices.len().div_ceil(5))
                     .max(1);
-                let filesystems_left = column_contains(&view.layout, "left", "filesystems");
                 for index in 0..page_count {
                     pages.push(DisplayView::new(
                         title.clone(),
                         DisplayPage::Storage {
-                            filesystems_left,
+                            filesystems_left: *filesystems_left,
                             filesystem_indices: filesystem_indices
                                 .iter()
                                 .skip(index * 3)
@@ -560,7 +618,18 @@ impl Config {
                 }
                 continue;
             }
-            let page = page_from_layout(&view.layout).with_context(|| format!("view {id:?}"))?;
+            let page = match &view.layout {
+                ViewLayout::Overview => DisplayPage::Overview,
+                ViewLayout::Resources => DisplayPage::Resources,
+                ViewLayout::PowerNetwork { ups_left } => DisplayPage::PowerNetwork {
+                    ups_left: *ups_left,
+                },
+                ViewLayout::Guests { offset, limit, .. } => DisplayPage::Guests {
+                    offset: *offset,
+                    limit: *limit,
+                },
+                ViewLayout::Storage { .. } => unreachable!("storage handled above"),
+            };
             pages.push(DisplayView::new(title, page));
         }
         Ok(pages)
@@ -616,7 +685,7 @@ impl Config {
         let mut incidents = Vec::new();
         for rule in &self.health.rules {
             if matches_condition(&rule.when, snapshot, self) {
-                let message = render_message(&rule.message, snapshot, self);
+                let message = render_message(rule, snapshot, self);
                 incidents.push(Incident::new(
                     IncidentId::Rule(RuleId::new(&rule.id).expect("validated health rule ID")),
                     rule.severity.into(),
@@ -700,70 +769,63 @@ fn validate_condition(condition: &Condition, config: &Config) -> Result<()> {
             if operators != 1 {
                 bail!("predicate must specify exactly one comparison");
             }
-            let known = matches!(
-                predicate.measurement.as_str(),
-                "ups.main.status"
-                    | "ups.main.stale"
-                    | "smart.*.status"
-                    | "network.uplink.up"
-                    | "network.internet.status"
-                    | "proxmox.backup.status"
-                    | "proxmox.backup.last_success_age"
-                    | "system.cpu.percent"
-                    | "system.memory.used_percent"
-                    | "system.io_pressure.percent"
-            ) || valid_filesystem_measurement(&predicate.measurement, config);
-            if !known {
-                bail!("unknown measurement {:?}", predicate.measurement);
+            if let MetricSelector::Filesystem { id, .. } = &predicate.measurement
+                && !config
+                    .sources
+                    .filesystems
+                    .iter()
+                    .any(|filesystem| filesystem.id == *id)
+            {
+                bail!("unknown filesystem measurement ID {id:?}");
             }
         }
     }
     Ok(())
 }
 
-fn valid_filesystem_measurement(path: &str, config: &Config) -> bool {
-    let parts: Vec<_> = path.split('.').collect();
-    parts.len() == 3
-        && parts[0] == "filesystem"
-        && matches!(parts[2], "mounted" | "used_percent")
-        && config
-            .sources
-            .filesystems
-            .iter()
-            .any(|filesystem| filesystem.id == parts[1])
-}
-
-fn page_from_layout(layout: &Value) -> Result<DisplayPage> {
+fn parse_view_layout(layout: &Value) -> Result<ViewLayout> {
     if contains(layout, "guest_list") {
         let offset = find_number(layout, "offset").unwrap_or(0);
         let limit = find_number(layout, "limit").unwrap_or(4);
-        return Ok(DisplayPage::Guests {
+        return Ok(ViewLayout::Guests {
+            paginate: find_bool(layout, "paginate").unwrap_or(false),
             offset: u32::try_from(offset)?,
             limit: u32::try_from(limit)?,
         });
     }
+    if contains(layout, "filesystems") && contains(layout, "smart") {
+        return Ok(ViewLayout::Storage {
+            filesystem_ids: find_string_list(layout, "filesystems")
+                .context("storage view requires a filesystem ID list")?,
+            smart_ids: find_string_list(layout, "smart")
+                .context("storage view requires a SMART device ID list")?,
+            filesystems_left: column_contains(layout, "left", "filesystems"),
+        });
+    }
     if column_contains(layout, "left", "health") && column_contains(layout, "right", "host_summary")
     {
-        Ok(DisplayPage::Overview)
+        Ok(ViewLayout::Overview)
     } else if contains(layout, "cpu") && contains(layout, "memory") {
-        Ok(DisplayPage::Resources)
+        Ok(ViewLayout::Resources)
     } else if column_contains(layout, "left", "ups") && column_contains(layout, "right", "network")
     {
-        Ok(DisplayPage::PowerNetwork { ups_left: true })
+        Ok(ViewLayout::PowerNetwork { ups_left: true })
     } else if column_contains(layout, "right", "ups") && column_contains(layout, "left", "network")
     {
-        Ok(DisplayPage::PowerNetwork { ups_left: false })
+        Ok(ViewLayout::PowerNetwork { ups_left: false })
     } else {
         bail!("layout cannot be rendered by the current firmware")
     }
 }
 
-fn resolve_indices(ids: &[String], available: &[&str], kind: &str) -> Result<Vec<u32>> {
+fn resolve_indices(
+    ids: &[String],
+    kind: &str,
+    find_index: impl Fn(&str) -> Option<usize>,
+) -> Result<Vec<u32>> {
     ids.iter()
         .map(|id| {
-            available
-                .iter()
-                .position(|candidate| *candidate == id)
+            find_index(id)
                 .with_context(|| format!("unknown {kind} ID {id:?}"))
                 .and_then(|index| {
                     u32::try_from(index).context("resource index exceeds protocol range")
@@ -855,9 +917,7 @@ fn matches_condition(condition: &Condition, snapshot: &HealthSnapshot, config: &
         Condition::Any { any } => any
             .iter()
             .any(|item| matches_condition(item, snapshot, config)),
-        Condition::Predicate(predicate) => metrics(&predicate.measurement, snapshot, config)
-            .iter()
-            .any(|value| matches_predicate(value, predicate)),
+        Condition::Predicate(predicate) => matches_selector(predicate, snapshot, config),
     }
 }
 
@@ -890,57 +950,55 @@ fn metric_equals(metric: &Metric, expected: &Value) -> bool {
     }
 }
 
-fn metrics(path: &str, snapshot: &HealthSnapshot, config: &Config) -> Vec<Metric> {
-    match path {
-        "ups.main.status" => vec![Metric::Text(ups_status(snapshot.ups.status))],
-        "ups.main.stale" => vec![Metric::Bool(snapshot.ups.stale)],
-        "smart.*.status" => snapshot
-            .smart
-            .devices()
-            .iter()
-            .map(|device| Metric::Text(smart_status(device.status)))
-            .collect(),
-        "network.uplink.up" => vec![Metric::Bool(snapshot.network_up)],
-        "network.internet.status" => vec![Metric::Text(internet_status(snapshot.internet_status))],
-        "proxmox.backup.status" => vec![Metric::Text(backup_status(snapshot.backup_job_status))],
-        "proxmox.backup.last_success_age" => vec![
-            snapshot
-                .last_successful_backup_age_seconds
-                .map_or(Metric::Missing, |value| Metric::Number(f64::from(value))),
-        ],
-        "system.cpu.percent" => vec![Metric::Number(f64::from(snapshot.cpu_percent))],
-        "system.memory.used_percent" => vec![Metric::Number(f64::from(memory_percent(snapshot)))],
-        "system.io_pressure.percent" => {
-            vec![Metric::Number(f64::from(snapshot.io_pressure_percent))]
+fn matches_selector(predicate: &Predicate, snapshot: &HealthSnapshot, config: &Config) -> bool {
+    match &predicate.measurement {
+        MetricSelector::SmartStatus => {
+            snapshot.smart.devices().iter().any(|device| {
+                matches_predicate(&Metric::Text(smart_status(device.status)), predicate)
+            })
         }
-        _ if path.starts_with("filesystem.") => filesystem_metric(path, snapshot, config),
-        _ => vec![Metric::Missing],
+        _ => matches_predicate(&metric(&predicate.measurement, snapshot, config), predicate),
     }
 }
 
-fn filesystem_metric(path: &str, snapshot: &HealthSnapshot, config: &Config) -> Vec<Metric> {
-    let mut parts = path.split('.');
-    let _ = parts.next();
-    let Some(id) = parts.next() else {
-        return vec![Metric::Missing];
-    };
-    let Some(field) = parts.next() else {
-        return vec![Metric::Missing];
-    };
-    let Some(index) = config.sources.filesystems.iter().position(|fs| fs.id == id) else {
-        return vec![Metric::Missing];
-    };
-    let Some(usage) = snapshot.filesystems.get(index).copied() else {
-        return vec![Metric::Missing];
-    };
-    match field {
-        "mounted" => vec![Metric::Bool(usage.mounted)],
-        "used_percent" => vec![Metric::Number(f64::from(usage.used_percent))],
-        _ => vec![Metric::Missing],
+fn metric(selector: &MetricSelector, snapshot: &HealthSnapshot, config: &Config) -> Metric {
+    match selector {
+        MetricSelector::UpsStatus => Metric::Text(ups_status(snapshot.ups.status)),
+        MetricSelector::UpsStale => Metric::Bool(snapshot.ups.stale),
+        MetricSelector::SmartStatus => Metric::Missing,
+        MetricSelector::NetworkUp => Metric::Bool(snapshot.network_up),
+        MetricSelector::InternetStatus => Metric::Text(internet_status(snapshot.internet_status)),
+        MetricSelector::BackupStatus => Metric::Text(backup_status(snapshot.backup_job_status)),
+        MetricSelector::BackupAge => snapshot
+            .last_successful_backup_age_seconds
+            .map_or(Metric::Missing, |value| Metric::Number(f64::from(value))),
+        MetricSelector::CpuPercent => Metric::Number(f64::from(snapshot.cpu_percent)),
+        MetricSelector::MemoryPercent => Metric::Number(f64::from(memory_percent(snapshot))),
+        MetricSelector::IoPressurePercent => {
+            Metric::Number(f64::from(snapshot.io_pressure_percent))
+        }
+        MetricSelector::Filesystem { id, field } => {
+            let Some(index) = config
+                .sources
+                .filesystems
+                .iter()
+                .position(|fs| fs.id == *id)
+            else {
+                return Metric::Missing;
+            };
+            let Some(usage) = snapshot.filesystems.get(index).copied() else {
+                return Metric::Missing;
+            };
+            match field {
+                FilesystemField::Mounted => Metric::Bool(usage.mounted),
+                FilesystemField::UsedPercent => Metric::Number(f64::from(usage.used_percent)),
+            }
+        }
     }
 }
 
-fn render_message(template: &str, snapshot: &HealthSnapshot, config: &Config) -> String {
+fn render_message(rule: &HealthRule, snapshot: &HealthSnapshot, config: &Config) -> String {
+    let template = &rule.message;
     let mut message = template.to_owned();
     if let Some(start) = template.find("filesystem.") {
         let rest = &template[start + 11..];
@@ -952,13 +1010,7 @@ fn render_message(template: &str, snapshot: &HealthSnapshot, config: &Config) ->
         }
     }
     if message.contains("{value}") {
-        let value = config
-            .health
-            .rules
-            .iter()
-            .find(|rule| rule.message == template)
-            .and_then(|rule| metrics_for_value(&rule.when, snapshot, config))
-            .unwrap_or(0.0);
+        let value = metrics_for_value(&rule.when, snapshot, config).unwrap_or(0.0);
         message = message.replace("{value}", &format!("{value:.0}"));
     }
     message
@@ -970,15 +1022,13 @@ fn metrics_for_value(
     config: &Config,
 ) -> Option<f64> {
     match condition {
-        Condition::Predicate(predicate) => metrics(&predicate.measurement, snapshot, config)
-            .into_iter()
-            .find_map(|value| {
-                if let Metric::Number(value) = value {
-                    Some(value)
-                } else {
-                    None
-                }
-            }),
+        Condition::Predicate(predicate) => {
+            if let Metric::Number(value) = metric(&predicate.measurement, snapshot, config) {
+                Some(value)
+            } else {
+                None
+            }
+        }
         Condition::All { all } => all
             .iter()
             .find_map(|condition| metrics_for_value(condition, snapshot, config)),
@@ -1082,6 +1132,27 @@ mod tests {
         config
     }
 
+    #[test]
+    fn configuration_v1_requires_an_explicit_migration() {
+        let yaml =
+            include_str!("../../deploy/servatory.yaml").replacen("version: 2", "version: 1", 1);
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            config.validate().unwrap_err().to_string(),
+            "unsupported configuration version 1"
+        );
+    }
+
+    #[test]
+    fn removed_fixed_source_options_are_rejected() {
+        let yaml = include_str!("../../deploy/servatory.yaml")
+            .replace("sources:\n", "sources:\n  system:\n    provider: procfs\n");
+        let error = serde_yaml::from_str::<Config>(&yaml)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown field `system`"));
+    }
+
     fn healthy_snapshot() -> HealthSnapshot {
         HealthSnapshot::new(
             "pve-01",
@@ -1136,7 +1207,7 @@ mod tests {
     #[test]
     fn yaml_validation_rejects_a_manifest_beyond_the_device_budget() {
         let mut config = current_config();
-        config.views.get_mut("overview").unwrap().title = "X".repeat(MAX_FRAME_LEN);
+        config.views.get_mut("overview").unwrap().title = "X".repeat(MAX_HOST_FRAME_LEN);
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("device frame budget"));
     }
@@ -1194,5 +1265,22 @@ mod tests {
         assert_eq!(incidents.len(), 2);
         assert_eq!(incidents[0].message(), "LINK DOWN");
         assert_eq!(incidents[1].message(), "CPU 99%");
+    }
+
+    #[test]
+    fn identical_templates_render_their_own_rule_values() {
+        let mut config = current_config();
+        for rule in &mut config.health.rules {
+            if matches!(rule.id.as_str(), "cpu_high" | "memory_high") {
+                rule.message = "LOAD {value}%".into();
+            }
+        }
+        let mut snapshot = healthy_snapshot();
+        snapshot.cpu_percent = 95;
+        snapshot.memory_used_mib = 31_000;
+        let (_, incidents) = config.evaluate_health(&snapshot);
+        let messages: Vec<_> = incidents.iter().map(Incident::message).collect();
+        assert!(messages.contains(&"LOAD 95%"));
+        assert!(messages.contains(&"LOAD 94%"));
     }
 }

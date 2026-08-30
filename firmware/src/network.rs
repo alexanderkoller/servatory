@@ -2,6 +2,7 @@ use alloc::{
     collections::VecDeque,
     format,
     string::{String, ToString},
+    sync::Arc,
     vec::Vec,
 };
 use core::{
@@ -94,8 +95,8 @@ const ISRG_ROOT_X1: &str = concat!(
 
 #[derive(Clone)]
 struct SharedState {
-    snapshot: Option<HealthSnapshot>,
-    manifest: Option<NetworkConfig>,
+    snapshot: Option<Arc<HealthSnapshot>>,
+    manifest: Option<Arc<NetworkConfig>>,
     last_update: Option<Instant>,
     station_ipv4: Option<Ipv4Addr>,
     ntfy_topic: Option<String>,
@@ -173,7 +174,7 @@ pub async fn update_daemon_version(version: SoftwareVersion) {
     STATE.lock().await.daemon_version = Some(version);
 }
 
-pub async fn update_snapshot(snapshot: HealthSnapshot) {
+pub async fn update_snapshot(snapshot: Arc<HealthSnapshot>) {
     let mut state = STATE.lock().await;
     state.snapshot = Some(snapshot);
     state.last_update = Some(Instant::now());
@@ -182,10 +183,10 @@ pub async fn update_snapshot(snapshot: HealthSnapshot) {
 pub async fn update_manifest(manifest: NetworkConfig) {
     set_web_server(manifest.http.enabled, manifest.http.port);
     let mut state = STATE.lock().await;
-    if state.manifest.as_ref() == Some(&manifest) {
+    if state.manifest.as_deref() == Some(&manifest) {
         return;
     }
-    state.manifest = Some(manifest.clone());
+    state.manifest = Some(Arc::new(manifest.clone()));
     drop(state);
     if let Err(embassy_sync::channel::TrySendError::Full(manifest)) = MANIFESTS.try_send(manifest) {
         let _ = MANIFESTS.try_receive();
@@ -209,7 +210,7 @@ pub async fn start(
         }
         {
             let mut state = STATE.lock().await;
-            state.manifest = settings.network.clone();
+            state.manifest = settings.network.clone().map(Arc::new);
             state.ntfy_topic = Some(settings.provisioning.ntfy_topic.clone());
         }
         start_station(spawner, wifi, store, settings, seed);
@@ -641,34 +642,50 @@ impl edge_http::io::server::Handler for HttpHandler {
             .await;
         }
 
-        let state = STATE.lock().await.clone();
         match path {
             "/api/v1/health" => {
-                let body = health_json(&state);
+                let body = {
+                    let state = STATE.lock().await;
+                    health_json(&state)
+                };
                 write_http_response(connection, 200, "OK", "application/json", &body).await?;
             }
             "/api/v1/device" => {
-                let age = snapshot_age(&state)
-                    .map(|age| age.as_secs())
-                    .unwrap_or(u64::MAX);
-                let address = state
-                    .station_ipv4
-                    .map_or_else(|| "0.0.0.0".to_string(), |address| address.to_string());
-                let daemon = state
-                    .daemon_version
-                    .as_ref()
-                    .map_or("unknown", SoftwareVersion::as_str);
-                let body = format!(
-                    "{{\"firmware\":\"{}\",\"daemon\":\"{daemon}\",\"protocol\":{PROTOCOL_VERSION},\"wifi\":\"connected\",\"ipv4\":\"{address}\",\"snapshot_age_seconds\":{age}}}",
-                    env!("SERVATORY_BUILD_VERSION"),
-                );
+                let body = {
+                    let state = STATE.lock().await;
+                    let age = snapshot_age(&state)
+                        .map(|age| age.as_secs())
+                        .unwrap_or(u64::MAX);
+                    let address = state
+                        .station_ipv4
+                        .map_or_else(|| "0.0.0.0".to_string(), |address| address.to_string());
+                    let daemon = state
+                        .daemon_version
+                        .as_ref()
+                        .map_or("unknown", SoftwareVersion::as_str);
+                    format!(
+                        "{{\"firmware\":\"{}\",\"daemon\":\"{daemon}\",\"protocol\":{PROTOCOL_VERSION},\"wifi\":\"connected\",\"ipv4\":\"{address}\",\"snapshot_age_seconds\":{age}}}",
+                        env!("SERVATORY_BUILD_VERSION"),
+                    )
+                };
                 write_http_response(connection, 200, "OK", "application/json", &body).await?;
+            }
+            "/api/v1/dashboard-fragment" => {
+                let body = {
+                    let state = STATE.lock().await;
+                    dashboard_fragment(&state)
+                };
+                write_http_response(connection, 200, "OK", "text/html; charset=utf-8", &body)
+                    .await?;
             }
             "/healthz" => {
                 write_http_response(connection, 200, "OK", "text/plain", "ok\n").await?;
             }
             _ => {
-                let body = dashboard_html(&state);
+                let body = {
+                    let state = STATE.lock().await;
+                    dashboard_html(&state)
+                };
                 write_http_response(connection, 200, "OK", "text/html; charset=utf-8", &body)
                     .await?;
             }
@@ -719,14 +736,7 @@ async fn mdns_responder(stack: Stack<'static>, hostname: String) {
         let Some(ipv4) = stack.config_v4().map(|config| config.address.address()) else {
             continue;
         };
-        let Ok(mut socket) = io::bind(
-            &udp,
-            io::IPV4_DEFAULT_SOCKET,
-            Some(ipv4),
-            None,
-        )
-        .await
-        else {
+        let Ok(mut socket) = io::bind(&udp, io::IPV4_DEFAULT_SOCKET, Some(ipv4), None).await else {
             Timer::after_secs(1).await;
             continue;
         };
@@ -837,6 +847,14 @@ fn notifiable_incidents(state: &SharedState) -> Vec<Incident> {
 }
 
 fn dashboard_html(state: &SharedState) -> String {
+    dashboard_markup(state, true)
+}
+
+fn dashboard_fragment(state: &SharedState) -> String {
+    dashboard_markup(state, false)
+}
+
+fn dashboard_markup(state: &SharedState, document: bool) -> String {
     let incidents = active_incidents(state);
     let age = snapshot_age(state).map(|age| age.as_secs());
     let stale = age.is_none_or(|age| age >= HOST_STALE_AFTER.as_secs());
@@ -845,7 +863,9 @@ fn dashboard_html(state: &SharedState) -> String {
         .map(|incident| incident.level)
         .max_by_key(|level| level.priority())
         .unwrap_or(HealthLevel::Healthy);
-    let mut html = String::from(
+    let mut html = String::new();
+    if document {
+        html.push_str(
         "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>\
          <style>\
          *{box-sizing:border-box}:root{color-scheme:light;--bg:#f3f6fa;--panel:#fff;--line:#dfe7ef;--muted:#68798a;--text:#152536}\
@@ -857,11 +877,13 @@ fn dashboard_html(state: &SharedState) -> String {
          p{color:#66788a}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(19rem,100%),1fr));gap:1rem}.card{border-radius:.9rem;padding:1.2rem;min-width:0}.wide{grid-column:1/-1}.facts{display:grid;gap:.7rem}.fact{display:grid;grid-template-columns:7rem minmax(0,1fr);gap:.7rem;padding-bottom:.65rem;border-bottom:1px solid var(--line)}.fact:last-child{border:0;padding-bottom:0}.fact strong{font:650 .86rem ui-monospace,SFMono-Regular,monospace;overflow-wrap:anywhere}\
          .topic{display:block;color:#135e4a;background:#f2f8f5;border:1px solid #cde4da;border-radius:.55rem;padding:.8rem;margin:.5rem 0 1rem;overflow-wrap:anywhere;user-select:all}.metric{margin:.85rem 0}.metric-row{display:flex;justify-content:space-between;gap:1rem;margin-bottom:.35rem}.bar{height:.48rem;background:#e7edf3;border-radius:1rem;overflow:hidden}.bar i{display:block;height:100%;background:linear-gradient(90deg,#3b82c4,var(--accent));border-radius:inherit}\
          button{appearance:none;border:1px solid #b9c7d5;border-radius:.55rem;background:#fff;color:#21384b;padding:.65rem .85rem;font-weight:750;cursor:pointer;margin:.2rem .35rem .2rem 0}button:hover{border-color:var(--accent);color:var(--accent);background:var(--soft)}button:disabled{cursor:wait;opacity:.75}.test-feedback{display:inline-block;min-width:5rem;color:var(--muted);font-size:.82rem;font-weight:700}.sending:before{content:'';display:inline-block;width:.75rem;height:.75rem;margin-right:.45rem;border:2px solid #b9c7d5;border-top-color:var(--accent);border-radius:50%;vertical-align:-.12rem;animation:spin .7s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}table{width:100%;border-collapse:collapse;font-size:.9rem}td{padding:.55rem .25rem;border-bottom:1px solid var(--line);vertical-align:top}td:last-child{text-align:right;color:#2b4356}.ok{color:#16805d}.warn{color:#a86400}.crit{color:#c7384b}ul{padding-left:1.2rem}li{padding:.25rem}small{color:var(--muted)}@media(max-width:500px){.fact{grid-template-columns:1fr;gap:.15rem}.shell{padding:.8rem}.hero{border-radius:.8rem}}</style>",
-    );
-    html.push_str(DASHBOARD_SCRIPT);
+        );
+        html.push_str(DASHBOARD_SCRIPT);
+        let _ = write!(html, "<body class={}>", level_class(level));
+    }
     let _ = write!(
         html,
-        "<body class={}><div class=shell><header class=hero><div class=live>{}</div>\
+        "<div class=shell data-body-class={}><header class=hero><div class=live>{}</div>\
          <div class=eyebrow style='margin-top:1.5rem'>SERVATORY STATUS</div><h1>{}</h1><p>{}</p></header>",
         level_class(level),
         if stale { "STALE" } else { "LIVE" },
@@ -883,7 +905,10 @@ fn dashboard_html(state: &SharedState) -> String {
     html.push_str("<main class=grid>");
     render_device_panels(&mut html, state);
     let Some(snapshot) = state.snapshot.as_ref() else {
-        html.push_str("</main></div></body>");
+        html.push_str("</main></div>");
+        if document {
+            html.push_str("</body>");
+        }
         return html;
     };
     let pages = state
@@ -909,10 +934,13 @@ fn dashboard_html(state: &SharedState) -> String {
         html.push_str("</span><h2>");
         push_html(&mut html, view.title.as_str());
         html.push_str("</h2></div>");
-        render_page(&mut html, &view.page, snapshot, pages);
+        render_page(&mut html, &view.page, snapshot);
         html.push_str("</section>");
     }
-    html.push_str("</main></div></body>");
+    html.push_str("</main></div>");
+    if document {
+        html.push_str("</body>");
+    }
     html
 }
 
@@ -974,12 +1002,7 @@ const fn page_icon(kind: usize) -> &'static str {
     }
 }
 
-fn render_page(
-    html: &mut String,
-    page: &DisplayPage,
-    snapshot: &HealthSnapshot,
-    pages: &[servatory_protocol::DisplayView],
-) {
+fn render_page(html: &mut String, page: &DisplayPage, snapshot: &HealthSnapshot) {
     match page {
         DisplayPage::Overview => {
             let _ = write!(html, "<p><b>{}</b><br>Host: ", snapshot.health.message());
@@ -1101,7 +1124,6 @@ fn render_page(
             html.push_str("</table>");
         }
     }
-    let _ = pages;
 }
 
 fn render_metric(html: &mut String, label: &str, percent: u8, detail: &str) {
@@ -1199,7 +1221,6 @@ fn push_json(output: &mut String, value: &str) {
     }
 }
 
-#[derive(Clone)]
 struct PendingNotification {
     message: String,
     priority: NotificationPriority,
@@ -1210,6 +1231,7 @@ struct NotificationWorkspace {
     tls_rx: PsramBox<[u8]>,
     tls_tx: PsramBox<[u8]>,
     response: PsramBox<[u8]>,
+    ca: Vec<u8>,
 }
 
 impl NotificationWorkspace {
@@ -1218,6 +1240,7 @@ impl NotificationWorkspace {
             tls_rx: zeroed_psram(NOTIFICATION_TLS_RX_SIZE),
             tls_tx: zeroed_psram(NOTIFICATION_TLS_TX_SIZE),
             response: zeroed_psram(NOTIFICATION_RESPONSE_SIZE),
+            ca: STANDARD.decode(ISRG_ROOT_X1).unwrap_or_default(),
         }
     }
 }
@@ -1311,7 +1334,7 @@ async fn notification_worker(stack: Stack<'static>, mut seed: u64) {
                 }
             }
             if let (Some(notification), Some(topic)) =
-                (pending.front().cloned(), state.ntfy_topic.as_deref())
+                (pending.front(), state.ntfy_topic.as_deref())
             {
                 seed = seed.wrapping_add(1);
                 if publish_notification(
@@ -1319,7 +1342,7 @@ async fn notification_worker(stack: Stack<'static>, mut seed: u64) {
                     &dns,
                     config,
                     topic,
-                    &notification,
+                    notification,
                     seed,
                     &mut workspace,
                 )
@@ -1361,16 +1384,15 @@ async fn publish_notification(
     } else {
         "Servatory incident"
     };
-    let ca = match STANDARD.decode(ISRG_ROOT_X1) {
-        Ok(ca) => ca,
-        Err(_) => return false,
-    };
+    if workspace.ca.is_empty() {
+        return false;
+    }
     let tls = TlsConfig::new(
         seed,
         workspace.tls_rx.as_mut(),
         workspace.tls_tx.as_mut(),
         TlsVerify::Certificate {
-            ca: &ca,
+            ca: &workspace.ca,
             cert: None,
             key: None,
         },

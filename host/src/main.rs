@@ -1,17 +1,18 @@
 use std::{
     io::Read,
     path::PathBuf,
-    process, thread,
+    process,
+    sync::{Arc, Mutex},
+    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
 use servatory_host::{EventHandler, SystemdShutdown, write_host_message};
 use servatory_protocol::{
     DeviceMessage, FrameDecoder, HandshakeNonce, HealthLevel, HealthReport, HostMessage,
-    MAX_FRAME_LEN, PROTOCOL_VERSION, ProtocolError, Sequence, SoftwareVersion, UnixSeconds,
-    decode_device,
+    MAX_DEVICE_FRAME_LEN, PROTOCOL_VERSION, ProtocolError, SoftwareVersion, decode_device,
 };
 
 mod config;
@@ -45,9 +46,9 @@ fn main() -> Result<()> {
     let device = &config.connection.usb_serial.device;
     let mut display_config = config.display_config(0)?;
     let mut network_config = config.network_config(0)?;
+    let mut configured_guest_pages = guest_page_count(0);
     let mut next_update = Instant::now();
-    let mut sequence = Sequence::ZERO;
-    let mut decoder = FrameDecoder::<MAX_FRAME_LEN>::new();
+    let mut decoder = FrameDecoder::<MAX_DEVICE_FRAME_LEN>::new();
     let mut handler = EventHandler::new(SystemdShutdown, config.actions.shutdown.enabled);
     let mut input = [0_u8; 64];
     let filesystem_paths: Vec<String> = config
@@ -56,7 +57,7 @@ fn main() -> Result<()> {
         .iter()
         .map(|item| item.path.clone())
         .collect();
-    let mut health = HealthCollector::new(
+    let health = HealthCollector::new(
         config.sources.ups.endpoint.clone(),
         config.sources.ups.failures_before_unavailable,
         config.sources.smart.devices.clone(),
@@ -64,6 +65,7 @@ fn main() -> Result<()> {
         Some(&config.sources.internet),
         config.sources.proxmox.backup.task_history_limit,
     );
+    let latest_health = spawn_health_collector(health, interval)?;
     let mut last_health_status = None;
     let mut port = None;
     let mut waiting_logged = false;
@@ -151,48 +153,50 @@ fn main() -> Result<()> {
             }
         }
 
-        if handshake_established && connection_error.is_none() && Instant::now() >= next_update {
-            let unix_seconds = current_unix_seconds()?;
-            let mut snapshot = health.collect();
-            let next_display_config = config.display_config(snapshot.guests.guests().len())?;
-            if next_display_config != display_config {
-                if let Err(error) = write_host_message(
-                    HostMessage::DisplayConfig(next_display_config.clone()),
-                    connected_port,
-                ) {
-                    connection_error = Some(error.context("updating display configuration"));
-                } else {
-                    display_config = next_display_config;
+        if handshake_established
+            && connection_error.is_none()
+            && Instant::now() >= next_update
+            && let Some(mut snapshot) = take_latest_health(&latest_health)
+        {
+            let guest_count = snapshot.guests.guests().len();
+            let next_guest_pages = guest_page_count(guest_count);
+            if next_guest_pages != configured_guest_pages {
+                let next_display_config = config.display_config(guest_count)?;
+                let next_network_config = config.network_config(guest_count)?;
+                if next_display_config != display_config {
+                    if let Err(error) = write_host_message(
+                        HostMessage::DisplayConfig(next_display_config.clone()),
+                        connected_port,
+                    ) {
+                        connection_error = Some(error.context("updating display configuration"));
+                    } else {
+                        display_config = next_display_config;
+                    }
                 }
-            }
-            let next_network_config = config.network_config(snapshot.guests.guests().len())?;
-            if next_network_config != network_config {
-                if let Err(error) = write_host_message(
-                    HostMessage::NetworkConfig(next_network_config.clone()),
-                    connected_port,
-                ) {
-                    connection_error = Some(error.context("updating network configuration"));
-                } else {
-                    network_config = next_network_config;
+                if connection_error.is_none() && next_network_config != network_config {
+                    if let Err(error) = write_host_message(
+                        HostMessage::NetworkConfig(next_network_config.clone()),
+                        connected_port,
+                    ) {
+                        connection_error = Some(error.context("updating network configuration"));
+                    } else {
+                        network_config = next_network_config;
+                    }
+                }
+                if connection_error.is_none() {
+                    configured_guest_pages = next_guest_pages;
                 }
             }
             let (status, incidents) = config.evaluate_health(&snapshot);
             snapshot.set_incidents(status.clone(), incidents);
             log_health_status_change(&mut last_health_status, status);
-            if connection_error.is_none()
-                && let Err(error) = write_host_message(
-                    HostMessage::HealthSnapshot {
-                        sequence,
-                        unix_seconds: UnixSeconds::new(unix_seconds),
-                        snapshot,
-                    },
-                    connected_port,
-                )
-            {
-                connection_error = Some(error.context("writing USB display"));
-            } else {
-                sequence = sequence.wrapping_next();
-                next_update = Instant::now() + interval;
+            if connection_error.is_none() {
+                match write_host_message(HostMessage::HealthSnapshot(snapshot), connected_port) {
+                    Ok(()) => next_update = Instant::now() + interval,
+                    Err(error) => {
+                        connection_error = Some(error.context("writing USB display"));
+                    }
+                }
             }
         }
 
@@ -247,18 +251,6 @@ fn main() -> Result<()> {
                                     next_hello = Instant::now();
                                 }
                             }
-                            Ok(DeviceMessage::Ready) => {
-                                // Ready confirms USB transport activity but
-                                // carries no firmware version. Only Hello can
-                                // establish a compatible protocol session.
-                                if let Err(error) =
-                                    handler.handle(&DeviceMessage::Ready, connected_port)
-                                {
-                                    connection_error =
-                                        Some(error.context("handling display ready message"));
-                                    break;
-                                }
-                            }
                             Ok(message) if handshake_established => {
                                 match handler.handle(&message, connected_port) {
                                     Ok(true) => return Ok(()),
@@ -306,11 +298,36 @@ fn main() -> Result<()> {
     }
 }
 
-fn current_unix_seconds() -> Result<u64> {
-    Ok(SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before the Unix epoch")?
-        .as_secs())
+fn spawn_health_collector(
+    mut collector: HealthCollector,
+    interval: Duration,
+) -> std::io::Result<Arc<Mutex<Option<servatory_protocol::HealthSnapshot>>>> {
+    let latest = Arc::new(Mutex::new(None));
+    let worker_latest = Arc::clone(&latest);
+    thread::Builder::new()
+        .name("health-collector".into())
+        .spawn(move || {
+            loop {
+                let snapshot = collector.collect();
+                let Ok(mut slot) = worker_latest.lock() else {
+                    return;
+                };
+                *slot = Some(snapshot);
+                drop(slot);
+                thread::sleep(interval);
+            }
+        })?;
+    Ok(latest)
+}
+
+fn take_latest_health(
+    latest: &Mutex<Option<servatory_protocol::HealthSnapshot>>,
+) -> Option<servatory_protocol::HealthSnapshot> {
+    latest.lock().ok()?.take()
+}
+
+fn guest_page_count(guest_count: usize) -> usize {
+    guest_count.max(1).div_ceil(4)
 }
 
 fn new_handshake_nonce() -> HandshakeNonce {
@@ -382,5 +399,15 @@ mod tests {
             changed_health_status(Some(HealthReport::healthy()), HealthReport::healthy()),
             None
         );
+    }
+
+    #[test]
+    fn guest_manifests_change_only_at_page_boundaries() {
+        assert_eq!(guest_page_count(0), 1);
+        assert_eq!(guest_page_count(1), 1);
+        assert_eq!(guest_page_count(4), 1);
+        assert_eq!(guest_page_count(5), 2);
+        assert_eq!(guest_page_count(8), 2);
+        assert_eq!(guest_page_count(9), 3);
     }
 }

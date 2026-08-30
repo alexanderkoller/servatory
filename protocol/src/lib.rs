@@ -7,10 +7,12 @@ use core::fmt;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-pub const PROTOCOL_VERSION: u8 = 9;
+pub const PROTOCOL_VERSION: u8 = 10;
 const FRAME_MAGIC: [u8; 2] = [0xa5, 0x5a];
-/// Maximum COBS-encoded frame size, including its trailing zero delimiter.
-pub const MAX_FRAME_LEN: usize = 16 * 1024;
+/// Maximum host-to-device COBS frame, including its trailing zero delimiter.
+pub const MAX_HOST_FRAME_LEN: usize = 4 * 1024;
+/// Maximum device-to-host COBS frame, including its trailing zero delimiter.
+pub const MAX_DEVICE_FRAME_LEN: usize = 128;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum HealthLevel {
@@ -312,41 +314,11 @@ impl Default for DisplayConfig {
             shutdown_hold_ms: 3_000,
             shutdown_animation_delay_ms: 200,
             daemon_version: SoftwareVersion::new("unknown"),
-            filesystem_labels: vec![
-                DisplayLabel::new("/"),
-                DisplayLabel::new("HDD"),
-                DisplayLabel::new("BACKUP"),
-            ],
-            pages: vec![
-                DisplayView::new(DisplayLabel::new("OVERVIEW"), DisplayPage::Overview),
-                DisplayView::new(DisplayLabel::new("RESOURCES"), DisplayPage::Resources),
-                DisplayView::new(
-                    DisplayLabel::new("STORAGE + SMART"),
-                    DisplayPage::Storage {
-                        filesystems_left: true,
-                        filesystem_indices: vec![0, 1, 2],
-                        smart_indices: vec![0, 1, 2, 3, 4],
-                    },
-                ),
-                DisplayView::new(
-                    DisplayLabel::new("UPS + ETHERNET"),
-                    DisplayPage::PowerNetwork { ups_left: true },
-                ),
-                DisplayView::new(
-                    DisplayLabel::new("GUESTS 1/2"),
-                    DisplayPage::Guests {
-                        offset: 0,
-                        limit: 4,
-                    },
-                ),
-                DisplayView::new(
-                    DisplayLabel::new("GUESTS 2/2"),
-                    DisplayPage::Guests {
-                        offset: 4,
-                        limit: 4,
-                    },
-                ),
-            ],
+            filesystem_labels: Vec::new(),
+            pages: vec![DisplayView::new(
+                DisplayLabel::new("OVERVIEW"),
+                DisplayPage::Overview,
+            )],
         }
     }
 }
@@ -396,62 +368,12 @@ impl fmt::Display for DisplayConfigError {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[repr(transparent)]
-pub struct Sequence(u32);
-
-impl Sequence {
-    pub const ZERO: Self = Self(0);
-
-    #[must_use]
-    pub const fn new(value: u32) -> Self {
-        Self(value)
-    }
-
-    #[must_use]
-    pub const fn get(self) -> u32 {
-        self.0
-    }
-
-    #[must_use]
-    pub const fn wrapping_next(self) -> Self {
-        Self(self.0.wrapping_add(1))
-    }
-}
-
-impl fmt::Display for Sequence {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[repr(transparent)]
 pub struct HandshakeNonce(u64);
 
 impl HandshakeNonce {
     #[must_use]
     pub const fn new(value: u64) -> Self {
         Self(value)
-    }
-
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[repr(transparent)]
-pub struct UnixSeconds(u64);
-
-impl UnixSeconds {
-    #[must_use]
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
     }
 }
 
@@ -579,8 +501,6 @@ pub enum ShutdownPhase {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ShutdownFailure {
-    GuestQuery,
-    GuestShutdown,
     HostPoweroff,
 }
 
@@ -742,10 +662,6 @@ impl HealthSnapshot {
         }
     }
 
-    pub fn set_health(&mut self, health: HealthReport) {
-        self.health = health;
-    }
-
     pub fn set_incidents(&mut self, health: HealthReport, active_incidents: Vec<Incident>) {
         self.health = health;
         self.active_incidents = active_incidents;
@@ -771,22 +687,8 @@ impl HealthSnapshot {
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum HostMessage {
-    /// A content-neutral heartbeat. Screen data will be added after the UI is designed.
-    Update {
-        sequence: Sequence,
-        unix_seconds: UnixSeconds,
-    },
     ShutdownAccepted,
-    GuestSnapshot {
-        sequence: Sequence,
-        unix_seconds: UnixSeconds,
-        snapshot: GuestSnapshot,
-    },
-    HealthSnapshot {
-        sequence: Sequence,
-        unix_seconds: UnixSeconds,
-        snapshot: HealthSnapshot,
-    },
+    HealthSnapshot(HealthSnapshot),
     ShutdownProgress {
         phase: ShutdownPhase,
         guests_total: u16,
@@ -804,20 +706,10 @@ pub enum HostMessage {
     NetworkConfig(NetworkConfig),
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub enum ButtonAction {
-    NextScreen,
-    ShutdownRequested,
-}
-
 /// Device-to-host messages. Variants may only be appended within a protocol version.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum DeviceMessage {
-    Ready,
-    Ack {
-        sequence: Sequence,
-    },
-    Button(ButtonAction),
+    ShutdownRequested,
     Hello {
         firmware_version: SoftwareVersion,
         acknowledged_session: Option<HandshakeNonce>,
@@ -1020,28 +912,15 @@ mod tests {
     fn messages_round_trip_as_typed_values() {
         let guest = guest("atlas");
         let host_messages = [
-            HostMessage::Update {
-                sequence: Sequence::new(42),
-                unix_seconds: UnixSeconds::new(1_700_000_000),
-            },
             HostMessage::ShutdownAccepted,
-            HostMessage::GuestSnapshot {
-                sequence: Sequence::new(43),
-                unix_seconds: UnixSeconds::new(1_700_000_005),
-                snapshot: GuestSnapshot::new(vec![guest.clone()]),
-            },
-            HostMessage::HealthSnapshot {
-                sequence: Sequence::new(44),
-                unix_seconds: UnixSeconds::new(1_700_000_010),
-                snapshot: snapshot(vec![guest]),
-            },
+            HostMessage::HealthSnapshot(snapshot(vec![guest])),
             HostMessage::ShutdownProgress {
                 phase: ShutdownPhase::StoppingGuests,
                 guests_total: 5,
                 guests_remaining: 3,
             },
             HostMessage::ShutdownFailed {
-                reason: ShutdownFailure::GuestShutdown,
+                reason: ShutdownFailure::HostPoweroff,
                 guests_remaining: 2,
             },
             HostMessage::Hello {
@@ -1050,18 +929,13 @@ mod tests {
             },
         ];
         for expected in host_messages {
-            let mut storage = [0; MAX_FRAME_LEN];
+            let mut storage = [0; MAX_HOST_FRAME_LEN];
             let frame = encode_host(expected.clone(), &mut storage).unwrap();
             assert_eq!(decode_host(frame), Ok(expected));
         }
 
         let device_messages = [
-            DeviceMessage::Ready,
-            DeviceMessage::Ack {
-                sequence: Sequence::new(42),
-            },
-            DeviceMessage::Button(ButtonAction::NextScreen),
-            DeviceMessage::Button(ButtonAction::ShutdownRequested),
+            DeviceMessage::ShutdownRequested,
             DeviceMessage::Hello {
                 firmware_version: SoftwareVersion::new("0.1.0"),
                 acknowledged_session: Some(HandshakeNonce::new(0x1234)),
@@ -1111,17 +985,18 @@ mod tests {
             ),
         };
         let expected = HostMessage::NetworkConfig(manifest);
-        let mut storage = [0; MAX_FRAME_LEN];
+        let mut storage = [0; MAX_HOST_FRAME_LEN];
         let frame = encode_host(expected.clone(), &mut storage).unwrap();
         assert_eq!(decode_host(frame), Ok(expected));
     }
 
     #[test]
     fn frame_decoder_handles_fragmentation() {
-        let expected = DeviceMessage::Ack {
-            sequence: Sequence::new(81),
+        let expected = DeviceMessage::Hello {
+            firmware_version: SoftwareVersion::new("0.2.0"),
+            acknowledged_session: Some(HandshakeNonce::new(81)),
         };
-        let mut encoded = [0; 32];
+        let mut encoded = [0; MAX_DEVICE_FRAME_LEN];
         let frame = encode_device(expected.clone(), &mut encoded).unwrap();
         let mut decoder = FrameDecoder::<32>::new();
         let mut received = None;
@@ -1192,17 +1067,17 @@ mod tests {
     }
 
     #[test]
-    fn current_messages_fit_one_usb_packet() {
-        let mut storage = [0; 64];
-        let frame = encode_host(
-            HostMessage::Update {
-                sequence: Sequence::new(u32::MAX),
-                unix_seconds: UnixSeconds::new(u64::MAX),
+    fn device_messages_fit_the_device_frame_budget() {
+        let mut storage = [0; MAX_DEVICE_FRAME_LEN];
+        let frame = encode_device(
+            DeviceMessage::Hello {
+                firmware_version: SoftwareVersion::new("0.2.0+g1234567890.dirty"),
+                acknowledged_session: Some(HandshakeNonce::new(u64::MAX)),
             },
             &mut storage,
         )
         .unwrap();
-        assert!(frame.len() <= 64);
+        assert!(frame.len() <= MAX_DEVICE_FRAME_LEN);
     }
 
     #[test]
@@ -1213,27 +1088,16 @@ mod tests {
         assert_eq!(value.guests.guests().len(), 40);
         assert_eq!(value.guests.guests()[0].name(), long_name);
 
-        let mut storage = [0; MAX_FRAME_LEN];
-        let frame = encode_host(
-            HostMessage::HealthSnapshot {
-                sequence: Sequence::new(u32::MAX),
-                unix_seconds: UnixSeconds::new(u64::MAX),
-                snapshot: value,
-            },
-            &mut storage,
-        )
-        .unwrap();
-        assert!(frame.len() <= MAX_FRAME_LEN);
+        let mut storage = [0; MAX_HOST_FRAME_LEN];
+        let frame = encode_host(HostMessage::HealthSnapshot(value), &mut storage).unwrap();
+        assert!(frame.len() <= MAX_HOST_FRAME_LEN);
     }
 
     #[test]
     fn frame_budget_is_the_only_collection_limit() {
         let mut storage = [0; 128];
-        let oversized_for_this_transport = HostMessage::GuestSnapshot {
-            sequence: Sequence::ZERO,
-            unix_seconds: UnixSeconds::new(0),
-            snapshot: GuestSnapshot::new(vec![guest("long-enough-name"); 40]),
-        };
+        let oversized_for_this_transport =
+            HostMessage::HealthSnapshot(snapshot(vec![guest("long-enough-name"); 40]));
         assert_eq!(
             encode_host(oversized_for_this_transport, &mut storage),
             Err(ProtocolError::Serialize)
