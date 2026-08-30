@@ -46,7 +46,7 @@ use servatory_protocol::{
 use static_cell::StaticCell;
 
 use crate::{
-    memory::{PsramBox, zeroed_psram},
+    memory::{INTERNAL_HEAP_BYTES, PsramBox, zeroed_psram},
     provisioning::{Provisioning, Store, StoredSettings},
 };
 
@@ -61,8 +61,15 @@ const MDNS_BUFFER_SIZE: usize = 768;
 const NOTIFICATION_TLS_RX_SIZE: usize = 16_384;
 const NOTIFICATION_TLS_TX_SIZE: usize = 4_096;
 const NOTIFICATION_RESPONSE_SIZE: usize = 1_024;
-const DASHBOARD_SCRIPT: &str = concat!("<script>", include_str!("dashboard.js"), "</script>");
-const DASHBOARD_STYLE: &str = concat!("<style>", include_str!("dashboard.css"), "</style>");
+const DASHBOARD_SCRIPT: &str = include_str!("dashboard.js");
+const DASHBOARD_STYLE: &str = include_str!("dashboard.css");
+const DASHBOARD_BODY_CAPACITY: usize = 16 * 1024;
+const DASHBOARD_DYNAMIC_RESPONSES: usize = 1;
+const MIN_NON_DASHBOARD_HEAP: usize = 80 * 1024;
+const _: () = assert!(
+    DASHBOARD_BODY_CAPACITY * DASHBOARD_DYNAMIC_RESPONSES + MIN_NON_DASHBOARD_HEAP
+        <= INTERNAL_HEAP_BYTES
+);
 const ISRG_ROOT_X1: &str = concat!(
     "MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw",
     "TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh",
@@ -121,6 +128,7 @@ impl SharedState {
 }
 
 static STATE: Mutex<CriticalSectionRawMutex, SharedState> = Mutex::new(SharedState::new());
+static DASHBOARD_RESPONSE: Mutex<CriticalSectionRawMutex, ()> = Mutex::new(());
 static MANIFESTS: Channel<CriticalSectionRawMutex, NetworkConfig, 1> = Channel::new();
 static TOPIC_UPDATES: Channel<CriticalSectionRawMutex, String, 1> = Channel::new();
 static TEST_NOTIFICATIONS: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
@@ -155,6 +163,62 @@ pub struct ProvisioningDisplay {
 
 static PROVISIONING_DISPLAY: CriticalMutex<RefCell<Option<ProvisioningDisplay>>> =
     CriticalMutex::new(RefCell::new(None));
+
+struct DashboardBuffer {
+    inner: String,
+    overflowed: bool,
+}
+
+impl DashboardBuffer {
+    fn new() -> Self {
+        Self {
+            inner: String::with_capacity(DASHBOARD_BODY_CAPACITY),
+            overflowed: false,
+        }
+    }
+
+    fn push_str(&mut self, value: &str) {
+        if self
+            .inner
+            .len()
+            .checked_add(value.len())
+            .is_some_and(|length| length <= DASHBOARD_BODY_CAPACITY)
+        {
+            self.inner.push_str(value);
+        } else {
+            self.overflowed = true;
+        }
+    }
+
+    fn push(&mut self, value: char) {
+        let mut bytes = [0_u8; 4];
+        self.push_str(value.encode_utf8(&mut bytes));
+    }
+
+    fn finish(self, document: bool) -> String {
+        if !self.overflowed {
+            return self.inner;
+        }
+        drop(self.inner);
+        if document {
+            "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'><title>Servatory</title><p>Dashboard data exceeds the firmware response budget.</p>".to_string()
+        } else {
+            "<div class=shell><p>Dashboard data exceeds the firmware response budget.</p></div>"
+                .to_string()
+        }
+    }
+}
+
+impl core::fmt::Write for DashboardBuffer {
+    fn write_str(&mut self, value: &str) -> core::fmt::Result {
+        self.push_str(value);
+        if self.overflowed {
+            Err(core::fmt::Error)
+        } else {
+            Ok(())
+        }
+    }
+}
 
 pub fn provisioning_display() -> Option<ProvisioningDisplay> {
     critical_section::with(|section| PROVISIONING_DISPLAY.borrow(section).borrow().clone())
@@ -679,21 +743,39 @@ impl edge_http::io::server::Handler for HttpHandler {
                 write_http_response(connection, 200, "OK", "application/json", &body).await?;
             }
             "/api/v1/dashboard-fragment" => {
-                let body = {
-                    let state = STATE.lock().await;
-                    dashboard_fragment(&state)
-                };
+                let _response = DASHBOARD_RESPONSE.lock().await;
+                let state = STATE.lock().await.clone();
+                let body = dashboard_fragment(&state);
                 write_http_response(connection, 200, "OK", "text/html; charset=utf-8", &body)
                     .await?;
+            }
+            "/dashboard.css" => {
+                write_http_response(
+                    connection,
+                    200,
+                    "OK",
+                    "text/css; charset=utf-8",
+                    DASHBOARD_STYLE,
+                )
+                .await?;
+            }
+            "/dashboard.js" => {
+                write_http_response(
+                    connection,
+                    200,
+                    "OK",
+                    "text/javascript; charset=utf-8",
+                    DASHBOARD_SCRIPT,
+                )
+                .await?;
             }
             "/healthz" => {
                 write_http_response(connection, 200, "OK", "text/plain", "ok\n").await?;
             }
             _ => {
-                let body = {
-                    let state = STATE.lock().await;
-                    dashboard_html(&state)
-                };
+                let _response = DASHBOARD_RESPONSE.lock().await;
+                let state = STATE.lock().await.clone();
+                let body = dashboard_html(&state);
                 write_http_response(connection, 200, "OK", "text/html; charset=utf-8", &body)
                     .await?;
             }
@@ -871,11 +953,9 @@ fn dashboard_markup(state: &SharedState, document: bool) -> String {
         .map(|incident| incident.level)
         .max_by_key(|level| level.priority())
         .unwrap_or(HealthLevel::Healthy);
-    let mut html = String::new();
+    let mut html = DashboardBuffer::new();
     if document {
-        html.push_str("<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta name=theme-color content='#08131d'><title>Servatory status</title>");
-        html.push_str(DASHBOARD_STYLE);
-        html.push_str(DASHBOARD_SCRIPT);
+        html.push_str("<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta name=theme-color content='#08131d'><title>Servatory status</title><link rel=stylesheet href=/dashboard.css><script defer src=/dashboard.js></script>");
         let _ = write!(html, "</head><body class={}>", level_class(level));
     }
     let age_text = age.map_or_else(
@@ -916,7 +996,7 @@ fn dashboard_markup(state: &SharedState, document: bool) -> String {
         if document {
             html.push_str("</body></html>");
         }
-        return html;
+        return html.finish(document);
     };
     let pages = state
         .manifest
@@ -953,10 +1033,10 @@ fn dashboard_markup(state: &SharedState, document: bool) -> String {
     if document {
         html.push_str("</body></html>");
     }
-    html
+    html.finish(document)
 }
 
-fn render_device_panels(html: &mut String, state: &SharedState) {
+fn render_device_panels(html: &mut DashboardBuffer, state: &SharedState) {
     let address = state
         .station_ipv4
         .map_or_else(|| "WAITING".to_string(), |address| address.to_string());
@@ -1056,7 +1136,7 @@ const fn dashboard_icon(kind: usize) -> &'static str {
 }
 
 fn render_page(
-    html: &mut String,
+    html: &mut DashboardBuffer,
     page: &DisplayPage,
     snapshot: &HealthSnapshot,
     filesystem_labels: &[DisplayLabel],
@@ -1378,7 +1458,7 @@ const fn internet_status_class(status: InternetStatus) -> &'static str {
     }
 }
 
-fn render_metric(html: &mut String, label: &str, percent: u8, detail: &str) {
+fn render_metric(html: &mut DashboardBuffer, label: &str, percent: u8, detail: &str) {
     html.push_str("<div class=metric><div class=metric-row><strong>");
     push_html(html, label);
     let _ = write!(html, "</strong><span>{percent}% · ");
@@ -1406,7 +1486,7 @@ fn level_text(level: HealthLevel) -> &'static str {
     }
 }
 
-fn push_html(output: &mut String, value: &str) {
+fn push_html(output: &mut DashboardBuffer, value: &str) {
     for character in value.chars() {
         match character {
             '&' => output.push_str("&amp;"),

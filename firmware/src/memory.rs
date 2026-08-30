@@ -5,6 +5,10 @@ use esp_hal::{
     psram::{FlashFreq, Psram, PsramConfig, PsramMode, PsramSize, SpiRamFreq},
 };
 
+pub const RECLAIMED_HEAP_BYTES: usize = 64 * 1024;
+pub const PRIMARY_HEAP_BYTES: usize = 48 * 1024;
+pub const INTERNAL_HEAP_BYTES: usize = RECLAIMED_HEAP_BYTES + PRIMARY_HEAP_BYTES;
+
 /// A heap containing only external PSRAM. Keeping it separate prevents normal
 /// allocations (especially atomics) from silently spilling out of SRAM.
 static PSRAM_HEAP: EspHeap = EspHeap::empty();

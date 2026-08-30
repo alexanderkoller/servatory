@@ -134,6 +134,29 @@ download mode. Hold its side reset button for about two seconds, then release it
 when the internal green LED flashes. Run the flashing command after the device
 has entered that mode.
 
+### Verify firmware without hardware
+
+Run the host-side suite before building firmware. It includes dashboard memory
+regressions and does not require a connected StickS3:
+
+```sh
+cargo test --workspace --locked
+```
+
+Every firmware compile also checks that dashboard responses remain bounded and
+serialized, that CSS and JavaScript stay in static responses, and that those
+assets remain within their flash-response budgets. A release build followed by
+the linker-layout check covers static SRAM, task pools, and PSRAM placement:
+
+```sh
+cd firmware
+cargo build --locked --release
+scripts/check-memory-layout.sh
+```
+
+The remote flashing script runs the release layout check automatically and
+refuses to flash if it fails.
+
 ## Use the display
 
 A short press on the front button advances to the next configured view. A

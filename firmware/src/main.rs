@@ -256,8 +256,8 @@ impl Button {
 async fn main(spawner: embassy_executor::Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
-    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 64 * 1024);
-    esp_alloc::heap_allocator!(size: 48 * 1024);
+    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: memory::RECLAIMED_HEAP_BYTES);
+    esp_alloc::heap_allocator!(size: memory::PRIMARY_HEAP_BYTES);
     let _psram = memory::initialize_psram(peripherals.PSRAM);
     let timer_group = TimerGroup::new(peripherals.TIMG0);
     let software_interrupts = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
