@@ -1,4 +1,32 @@
 let dashboardBusy = false;
+let refreshFailed = false;
+
+function formatSnapshotAge(seconds) {
+    if (seconds === 0) return 'Updated just now';
+    if (seconds === 1) return 'Updated 1 second ago';
+    return `Updated ${seconds} seconds ago`;
+}
+
+function initializeSnapshotClock(shell) {
+    shell.dataset.ageStarted = Date.now();
+}
+
+function updateSnapshotAge() {
+    const shell = document.querySelector('.shell');
+    if (!shell) return;
+    const ageLabel = shell.querySelector('.snapshot-age');
+    const badge = shell.querySelector('.live');
+    const baseAge = Number(shell.dataset.snapshotAge);
+    const staleAfter = Number(shell.dataset.staleAfter);
+    const elapsed = Math.floor((Date.now() - Number(shell.dataset.ageStarted)) / 1000);
+    const hasSnapshot = baseAge >= 0;
+    const age = hasSnapshot ? baseAge + Math.max(0, elapsed) : 0;
+    const stale = !hasSnapshot || age >= staleAfter;
+    if (ageLabel) ageLabel.textContent = hasSnapshot ? formatSnapshotAge(age) : 'No host snapshot received';
+    if (badge) badge.textContent = !hasSnapshot ? 'NO DATA' : stale ? 'STALE' : refreshFailed ? 'RETRYING' : 'LIVE';
+    shell.classList.toggle('is-stale', stale);
+    shell.classList.toggle('refresh-failed', refreshFailed);
+}
 
 async function refreshDashboard() {
     if (dashboardBusy || document.hidden) return;
@@ -13,8 +41,12 @@ async function refreshDashboard() {
         if (!freshShell || !currentShell) throw new Error('dashboard content missing');
         document.body.className = freshShell.dataset.bodyClass;
         currentShell.replaceWith(freshShell);
+        refreshFailed = false;
+        initializeSnapshotClock(freshShell);
+        updateSnapshotAge();
     } catch (_) {
-        // Keep the last usable dashboard visible; the next interval retries.
+        refreshFailed = true;
+        updateSnapshotAge();
     } finally {
         dashboardBusy = false;
     }
@@ -63,5 +95,12 @@ async function copyNtfyTopic(button) {
     setTimeout(() => { button.textContent = original; }, 1600);
 }
 
+const initialShell = document.querySelector('.shell');
+if (initialShell) initializeSnapshotClock(initialShell);
+updateSnapshotAge();
+setInterval(updateSnapshotAge, 1000);
 setInterval(refreshDashboard, 5000);
-document.addEventListener('visibilitychange', refreshDashboard);
+document.addEventListener('visibilitychange', () => {
+    updateSnapshotAge();
+    refreshDashboard();
+});

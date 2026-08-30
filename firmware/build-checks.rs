@@ -21,12 +21,27 @@ pub fn validate_dashboard(network: &str, css: &[u8], javascript: &[u8]) -> Resul
     for required in [
         "href=/dashboard.css",
         "src=/dashboard.js",
+        "data-snapshot-age",
         "DASHBOARD_BODY_CAPACITY",
         "DASHBOARD_RESPONSE.lock().await",
     ] {
         if !network.contains(required) {
             return Err(format!(
                 "firmware dashboard memory invariant is missing `{required}`"
+            ));
+        }
+    }
+    for required in [
+        "function updateSnapshotAge()",
+        "setInterval(updateSnapshotAge, 1000)",
+        "refreshFailed = true",
+    ] {
+        if !javascript
+            .windows(required.len())
+            .any(|window| window == required.as_bytes())
+        {
+            return Err(format!(
+                "firmware dashboard freshness invariant is missing `{required}`"
             ));
         }
     }

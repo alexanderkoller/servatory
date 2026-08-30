@@ -948,11 +948,13 @@ fn dashboard_markup(state: &SharedState, document: bool) -> String {
     let incidents = active_incidents(state);
     let age = snapshot_age(state).map(|age| age.as_secs());
     let stale = age.is_none_or(|age| age >= HOST_STALE_AFTER.as_secs());
-    let level = incidents
-        .iter()
-        .map(|incident| incident.level)
-        .max_by_key(|level| level.priority())
-        .unwrap_or(HealthLevel::Healthy);
+    // Freshness is represented separately by the LIVE/STALE badge. Keep the
+    // headline tied to the last actual host health result instead of rewriting
+    // a healthy snapshot as critical merely because it is cached.
+    let level = state
+        .snapshot
+        .as_ref()
+        .map_or(HealthLevel::Critical, |snapshot| snapshot.health.level);
     let mut html = DashboardBuffer::new();
     if document {
         html.push_str("<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta name=theme-color content='#f2f6f8'><title>Servatory status</title><link rel=stylesheet href=/dashboard.css><script defer src=/dashboard.js></script>");
@@ -966,11 +968,13 @@ fn dashboard_markup(state: &SharedState, document: bool) -> String {
             _ => format!("Updated {seconds} seconds ago"),
         },
     );
+    let age_value = age.map_or(-1_i64, |seconds| seconds as i64);
     let _ = write!(
         html,
-        "<div class=shell data-body-class={}><header class=hero><div class=hero-top><div class=brand><span class=brand-mark>{}</span><span>SERVATORY</span></div><div class=live>{}</div></div>\
-         <div class=hero-status><div class=eyebrow>System health</div><h1>{}</h1><p>{}</p></div></header>",
+        "<div class=shell data-body-class={} data-snapshot-age={age_value} data-stale-after={}><header class=hero><div class=hero-top><div class=brand><span class=brand-mark>{}</span><span>SERVATORY</span></div><div class=live>{}</div></div>\
+         <div class=hero-status><div class=eyebrow>System health</div><h1>{}</h1><p class=snapshot-age aria-live=polite>{}</p></div></header>",
         level_class(level),
+        HOST_STALE_AFTER.as_secs(),
         dashboard_icon(0),
         if stale { "STALE" } else { "LIVE" },
         level_text(level),

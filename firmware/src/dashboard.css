@@ -175,6 +175,20 @@ h2 {
     font-size: .95rem;
 }
 
+.snapshot-age { transition: color .2s; }
+
+.shell.is-stale .snapshot-age {
+    color: #a76500;
+    font-weight: 750;
+}
+
+.shell.is-stale .page-card {
+    opacity: .7;
+    filter: saturate(.55);
+}
+
+.shell.refresh-failed:not(.is-stale) .live { color: #a76500; }
+
 .grid {
     display: grid;
     grid-template-columns: repeat(12, minmax(0, 1fr));

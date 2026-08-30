@@ -53,3 +53,23 @@ fn rejects_assets_that_outgrow_the_flash_response_budget() {
     let error = build_checks::validate_dashboard(NETWORK, &oversized_css, JAVASCRIPT).unwrap_err();
     assert!(error.contains("dashboard.css"));
 }
+
+#[test]
+fn rejects_removing_the_client_side_snapshot_clock() {
+    const NEEDLE: &[u8] = b"setInterval(updateSnapshotAge, 1000)";
+    let unsafe_javascript = JAVASCRIPT
+        .windows(NEEDLE.len())
+        .enumerate()
+        .find(|(_, window)| *window == NEEDLE)
+        .map(|(index, _)| {
+            let mut javascript = JAVASCRIPT.to_vec();
+            javascript.splice(
+                index..index + NEEDLE.len(),
+                b"/* freshness clock removed */".iter().copied(),
+            );
+            javascript
+        })
+        .expect("production JavaScript has the freshness clock");
+    let error = build_checks::validate_dashboard(NETWORK, CSS, &unsafe_javascript).unwrap_err();
+    assert!(error.contains("freshness invariant"));
+}
